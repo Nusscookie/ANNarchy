@@ -40,6 +40,32 @@ See <https://annarchy.github.io/Installation> for further instructions.
 * MacOS X
 * Windows (inside WSL2)
 
+### Apple GPUs (Metal)
+
+On Apple Silicon Macs, rate-coded networks can be simulated on the GPU:
+
+```python
+import ANNarchy as ann
+
+net = ann.Network()
+net.config(paradigm="metal")   # implies dtype=float32, Metal GPUs have no double precision
+```
+
+The Metal backend reuses the CUDA code generators: the generated CUDA kernels
+are translated into Metal shaders, the host code runs on top of a small CUDA
+compatibility layer (`ANNarchy/include/metal`). It requires Apple's `clang++`
+(Command Line Tools). The shaders are compiled at runtime, or ahead of time if
+the Metal Toolchain of Xcode is installed (`xcrun -sdk macosx metal`).
+
+Supported: rate-coded populations (including `TimedArray` and `InputArray`),
+rate-coded projections (`csr`, `dense`, `ellr`, `sell` formats, uniform delays,
+synaptic plasticity), `Convolution` and `Pooling`, monitors, random
+variables and global operations. Not supported (yet): profiling and
+non-uniform delays; spiking networks are experimental.
+
+Setting the environment variable `ANNARCHY_METAL_PROFILE=1` prints the GPU
+time of each kernel at the end of the process.
+
 ## Dependencies
 
 * `python` >= 3.10 (with the development files, e.g. `python-dev` or `python-devel`)

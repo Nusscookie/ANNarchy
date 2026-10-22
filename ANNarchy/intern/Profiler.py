@@ -40,7 +40,9 @@ class Profiler:
         # Storage folder and filename
         self._net_id = net_id
         self._profile_folder = profile_out
-        if ConfigManager().get("paradigm", net_id=net_id) == "cuda":
+        if ConfigManager().get("paradigm", net_id=net_id) == "metal":
+            raise AttributeError("Profiling is not supported yet for the Metal paradigm.")
+        elif ConfigManager().get("paradigm", net_id=net_id) == "cuda":
             self._profile_fname = f"profile_net{self._net_id}_cuda.csv"
         elif ConfigManager().get("paradigm", net_id=net_id) == "openmp":
             self._profile_fname = f"profile_net{self._net_id}_openmp_{ConfigManager().get('num_threads', net_id=net_id)}threads.csv"

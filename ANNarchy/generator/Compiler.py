@@ -379,7 +379,7 @@ class Compiler(object):
                 self.user_config = json.load(rfile)
 
         # Sanity check if the NVCC compiler is available
-        if _check_paradigm("cuda", self.net_id):
+        if _check_paradigm("cuda", self.net_id) and not _check_paradigm("metal", self.net_id):
             cmd = self.user_config["cuda"]["compiler"] + " --version 1> /dev/null"
 
             if os.system(cmd) != 0:
@@ -539,8 +539,10 @@ class Compiler(object):
 
         # Build final cmake command. One can add other arguments for debugging, such as:
         # -DCMAKE_EXPORT_COMPILE_COMMANDS=ON   - creates a 'compile_commands.json' which can be used to track compilation commands
-        run_command = 'cmake -S "{}" -B "{}" -DCMAKE_BUILD_TYPE={} -DUSE_PROFILE={} {}'.format(
-            target_dir, target_dir, run_mode, prof_mode, verbose
+        # The Python interpreter running ANNarchy is passed to CMake, as it provides
+        # numpy and nanobind (e.g. a virtual environment which is not activated).
+        run_command = 'cmake -S "{}" -B "{}" -DCMAKE_BUILD_TYPE={} -DUSE_PROFILE={} -DPython_EXECUTABLE="{}" {}'.format(
+            target_dir, target_dir, run_mode, prof_mode, sys.executable, verbose
         )
 
         # Generate the Makefile from CMakeLists
@@ -710,7 +712,16 @@ class Compiler(object):
                 makefile_template = linux_omp_template
 
         elif sys.platform == "darwin":  # mac os
-            if self.compiler == "clang++":
+            if _check_paradigm("metal", self.net_id):
+                makefile_template = osx_metal_template
+                omp_flag = ""
+                metal_config = self.user_config.get("metal", {})
+                # Objective-C++ (Metal runtime) requires Apple's clang
+                self.compiler = metal_config.get("compiler", "/usr/bin/clang++")
+                if "flags" in metal_config:
+                    cpu_flags = metal_config["flags"] if not self.debug_build else "-O0 -g"
+                metallib = _metallib_build_rules(self.net_id)
+            elif self.compiler == "clang++":
                 makefile_template = osx_clang_template
                 if (
                     ConfigManager().get("num_threads", self.net_id) == 1
@@ -724,6 +735,9 @@ class Compiler(object):
             Messages.warning(
                 "Compilation on windows is not supported yet. We recommend to use WSL on windows systems."
             )
+
+        if not _check_paradigm("metal", self.net_id):
+            metallib = ""
 
         # Gather all Makefile flags
         makefile_flags = {
@@ -743,6 +757,7 @@ class Compiler(object):
             "thirdparty_include": thirdparty_include,
             "net_id": self.net_id,
             "cython_ext": path_to_cython_ext,
+            "metallib": metallib,
         }
 
         # Write the Makefile to the disk
@@ -770,6 +785,25 @@ class Compiler(object):
         generator = CodeGenerator(self.annarchy_dir, self.net_id, self.cuda_config)
 
         generator.generate()
+
+
+def _metallib_build_rules(net_id):
+    """
+    CMake rules to compile the shader library ahead of time. This requires the
+    Metal compiler shipped with Xcode (Metal Toolchain). If it is not available,
+    the shaders are compiled at runtime by the Metal framework.
+    """
+    try:
+        subprocess.check_output(
+            ["xcrun", "-sdk", "macosx", "-f", "metal"], stderr=subprocess.DEVNULL
+        )
+        subprocess.check_output(
+            ["xcrun", "-sdk", "macosx", "-f", "metallib"], stderr=subprocess.DEVNULL
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return ""
+
+    return metallib_template % {"net_id": net_id}
 
 
 def load_cython_lib(libname, libpath):
@@ -887,6 +921,13 @@ def _instantiate(
         else:
             if ConfigManager().get("verbose", net_id):
                 print("Running simulation single-threaded.")
+
+    elif _check_paradigm("metal", net_id):
+        # There is only one GPU on Apple Silicon
+        cython_module.set_device(0)
+
+        if ConfigManager().get("verbose", net_id):
+            print("Running simulation on the GPU using Metal.")
 
     elif _check_paradigm("cuda", net_id):
         # check if there is a configuration,

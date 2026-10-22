@@ -231,7 +231,7 @@ class Pooling(SpecificProjection):
         # Create the Cython instance
         self.cyInstance = getattr(module, "proj" + str(self.id) + "_wrapper")()
         self.cyInstance.pre_coords = self.pre_coordinates
-        if ConfigManager().get("paradigm", self.net_id) == "cuda":
+        if _check_paradigm("cuda", self.net_id):
             # triggers host-to-device transfer at begin of simulate()
             self.cyInstance.pre_coords_dirty = True
 
@@ -577,14 +577,35 @@ class Pooling(SpecificProjection):
         """
         # Extract operation and pre-synaptic variable which should be processed
         pool_operation = self.synapse_type.operation
-        pre_var = self.synapse_type.psp.split(".")[1]
+        pre_deps = self.synapse_type.description["dependencies"]["pre"]
+        if len(pre_deps) != 1 or len(self.synapse_type.description["dependencies"]["post"]) > 0:
+            Messages.error(
+                "Pooling: on GPUs, the psp must depend on exactly one pre-synaptic variable (and no post-synaptic one):",
+                self.synapse_type.psp,
+            )
+        pre_var = pre_deps[0]
+
+        # The kernels load the pre-synaptic value into local_r, a psp different from
+        # "pre.var" (e.g. "pow(pos(pre.r), 2.0)") is applied to this value.
+        psp = self.synapse_type.description["psp"]["cpp"] % {
+            "id_pre": self.pre.id,
+            "id_post": self.post.id,
+            "local_index": "",
+            "global_index": "",
+            "pre_index": "__PRE_IDX__",
+            "post_index": "",
+            "pre_prefix": "",
+            "post_prefix": "",
+        }
+        psp = psp.replace(pre_var + "__PRE_IDX__", "local_r")
+        apply_psp = "" if psp.strip() == "local_r" else "local_r = " + psp + ";"
 
         # default value for sum in code depends on operation
         sum_default = "0.0"
         if pool_operation == "min":
             sum_default = "FLT_MAX"
         elif pool_operation == "max":
-            sum_default = "FLT_MIN"
+            sum_default = "-FLT_MAX"
 
         # operation to perform
         pool_op_code = cuda_op_code[pool_operation] % {
@@ -610,7 +631,18 @@ class Pooling(SpecificProjection):
             "target": self.target,
             "float_prec": ConfigManager().get("precision", self.net_id),
             "size_post": self.post.size,  # TODO: population views?
+            "pre_array": "pop%(id_pre)s->gpu_%(pre_var)s" % {"id_pre": self.pre.id, "pre_var": pre_var},
+            "apply_psp": tabify(apply_psp, 4),
+            "pre_var": pre_var,
         }
+
+        # Delayed variables are stored in a queue of device arrays
+        if self.delays > ConfigManager().get("dt", self.net_id):
+            base_ids["pre_array"] = "pop%(id_pre)s->gpu_delayed_%(pre_var)s[%(delay)s]" % {
+                "id_pre": self.pre.id,
+                "pre_var": pre_var,
+                "delay": int(self.delays / ConfigManager().get("dt", self.net_id)) - 1,
+            }
 
         # The correct templates depends on both
         # kernel-geometry and extent

@@ -6,7 +6,7 @@
 import numpy as np
 
 from ANNarchy.intern.SpecificPopulation import SpecificPopulation
-from ANNarchy.intern.ConfigManagement import ConfigManager
+from ANNarchy.intern.ConfigManagement import ConfigManager, _check_paradigm
 from ANNarchy.intern import Messages
 from ANNarchy.core.Population import Population
 from ANNarchy.core.Neuron import Neuron
@@ -301,7 +301,7 @@ class TimedArray(SpecificPopulation):
         super()._generate()
 
         # CUDA requires extra accessors for HtoD / DtoH - transfers
-        used_cuda = ConfigManager().get("paradigm", self.net_id) == "cuda"
+        used_cuda = _check_paradigm("cuda", self.net_id)
         cuda_acc = (
             f'.def_rw("r_host_to_device", &PopStruct{self.id}::r_host_to_device)\n'
             if used_cuda
@@ -608,7 +608,7 @@ class TimedArray(SpecificPopulation):
         #ifndef NDEBUG
             std::cout << "  clear previously allocated buffers ..." << std::endl;
         #endif
-            for (auto it = _gpu_buffer.begin(); it != _gpu_buffer.begin(); it++) {
+            for (auto it = _gpu_buffer.begin(); it != _gpu_buffer.end(); it++) {
                 cudaError_t err_on_free = cudaFree(*it);
                 if ( err_on_free != cudaSuccess ) {
                     std::cout << "TimedArray%(id)s::set_buffer():" << std::endl;
@@ -651,13 +651,13 @@ class TimedArray(SpecificPopulation):
         }
 
         // set the correct read-out position
-        if (_schedule[_block] > _t)
+        if (_block > 0 && _schedule[_block] > _t)
             gpu_r = _gpu_buffer[_block-1];
         else
             gpu_r = _gpu_buffer[_block];
 
         // Explicitly update read-only r
-        cudaMemcpy( r.data(), gpu_r, size*sizeof(double), cudaMemcpyDeviceToHost);
+        cudaMemcpy( r.data(), gpu_r, size*sizeof(%(float_prec)s), cudaMemcpyDeviceToHost);
         r_device_to_host = t;
 
     #ifndef NDEBUG
@@ -752,14 +752,14 @@ class TimedArray(SpecificPopulation):
 
         #ifndef NDEBUG
             std::cout << "TimedArray%(id)s::update() - current r: [ ";
-            auto tmp = std::vector<double>(size);
-            cudaMemcpy( tmp.data(), gpu_r, size*sizeof(double), cudaMemcpyDeviceToHost);
+            auto tmp = std::vector<%(float_prec)s>(size);
+            cudaMemcpy( tmp.data(), gpu_r, size*sizeof(%(float_prec)s), cudaMemcpyDeviceToHost);
             for(auto it = tmp.begin(); it != tmp.end(); it++)
                 std::cout << *it << " ";
             std::cout << "]" << std::endl;
         #endif
         }
-""" % {"id": self.id}
+""" % {"id": self.id, "float_prec": ConfigManager().get("precision", self.net_id)}
 
         # call the switch of CPU-buffers (host-side)
         self._specific_template["update_variable_call"] = f"""

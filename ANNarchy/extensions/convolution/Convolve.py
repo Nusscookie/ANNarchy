@@ -501,13 +501,13 @@ class Convolution(SpecificProjection):
 
         # Set the filter coordinates
         self.cyInstance.pre_coords = self.pre_coordinates
-        if ConfigManager().get("paradigm", self.net_id) == "cuda":
+        if _check_paradigm("cuda", self.net_id):
             # triggers host-to-device transfer at begin of simulate()
             self.cyInstance.pre_coords_dirty = True
 
         # Set the filters
         self.cyInstance.w = self.weights
-        if ConfigManager().get("paradigm", self.net_id) == "cuda":
+        if _check_paradigm("cuda", self.net_id):
             # triggers host-to-device transfer at begin of simulate()
             self.cyInstance.w_dirty = True
 
@@ -896,10 +896,9 @@ class Convolution(SpecificProjection):
                 % {"type_w": cpp_type_w, "id_proj": self.id}
             )
 
-            # Memory transfer of variables
-            dim_pre = self.dim_pre
-            if self.multiple:
-                dim_pre += 1
+            # Memory transfer of variables: the host-side filter is a nested
+            # vector with one level per dimension of the weights
+            dim_pre = len(np.asarray(self.weights).shape)
             self._specific_template["host_device_transfer"] += conv_filter_template[
                 "cuda"
             ]["host_device_transfer"] % {
@@ -935,7 +934,12 @@ class Convolution(SpecificProjection):
                 ", const %(type)s* __restrict__ pre_%(name)s" % pre_id_dict
             )
             pre_variables_invoke += ", pre_%(name)s" % pre_id_dict
-            pre_variables_call += ", pop%(id_pre)s->gpu_%(name)s" % pre_id_dict
+            if self.delays > ConfigManager().get("dt", self.net_id):
+                # delayed variables are stored in a queue of device arrays (all pre-synaptic
+                # dependencies of a delayed projection are delayed, see CodeGenerator)
+                pre_variables_call += ", pop%(id_pre)s->gpu_delayed_%(name)s[proj%(id_proj)s->delay-1]" % dict(pre_id_dict, id_proj=self.id)
+            else:
+                pre_variables_call += ", pop%(id_pre)s->gpu_%(name)s" % pre_id_dict
 
         # Finalize code templates
         code_ids = {
@@ -948,7 +952,8 @@ class Convolution(SpecificProjection):
             "pre_variables_header": pre_variables_header,
             "pre_variables_invoke": pre_variables_invoke,
             "pre_variables_call": pre_variables_call,
-            "pre_variable": "pre_%(name)s" % pre_id_dict
+            "pre_variable": "pre_%(name)s" % pre_id_dict,
+            "post_size": self.post.size,
         }
 
         # Finalize the processing code
@@ -975,8 +980,12 @@ class Convolution(SpecificProjection):
                 {"filter_dim": self.dim_kernel, "num_elem_filter": num_elem_per_filter}
             )
 
-            # Bank of filters
-            if len(self.weights.shape) == 3 and len(self.pre.geometry) == 2:
+            # Bank of filters: the specialized kernels use one thread per filter
+            # element, which is limited by the maximal threadgroup size
+            threads_per_filter = int(np.prod(self.weights.shape[1:]))
+            # ... and they implement only the default psp (w * pre.r)
+            default_psp = self.synapse_type.psp.replace(" ", "") in ["w*pre.r", "pre.r*w"]
+            if len(self.weights.shape) == 3 and len(self.pre.geometry) == 2 and threads_per_filter <= 1024 and default_psp:
                 code_ids.update(
                     {
                         "post_size": self.post.size,
@@ -1002,7 +1011,7 @@ class Convolution(SpecificProjection):
                     cuda_convolution_bank_of_filter_3d["call"] % code_ids
                 )
 
-            elif len(self.weights.shape) == 4 and len(self.pre.geometry) == 3:
+            elif len(self.weights.shape) == 4 and len(self.pre.geometry) == 3 and int(np.prod(self.weights.shape[1:3])) <= 1024 and default_psp:
                 code_ids.update(
                     {
                         "post_size": self.post.size,

@@ -247,7 +247,7 @@ public:
         if(this->record_%(name)s && ( (t - this->offset_) %% this->period_ == this->period_offset_ )){
             auto host_local = proj%(id)s->get_device_matrix_variable_as_lil<%(float_prec)s>(proj%(id)s->gpu_%(name)s);
 
-            std::vector< std::vector< double > > tmp;
+            std::vector< std::vector< %(type)s > > tmp;
             for (auto idx = 0; idx < this->ranks.size(); idx++) {
                 tmp.push_back(host_local[this->indices[idx]]);
             }

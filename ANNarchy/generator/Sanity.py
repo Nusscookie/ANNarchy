@@ -167,7 +167,7 @@ def check_experimental_features(populations, projections):
                     Messages.error("Invalid storage order provided:", fmt[1])
 
     # GPU-related formats
-    elif ConfigManager().get("paradigm", net_id) == "cuda":
+    elif _check_paradigm("cuda", net_id):
         for fmt in detected_formats:
             if fmt == "lil" or fmt == "csr":
                 # nothing to tell, its the default

@@ -180,6 +180,9 @@ package_data = [
     "cython_ext/CSRMatrix.hpp",
     "include/*.hpp",
     "include/*.cuh",
+    "include/metal/*.h",
+    "include/metal/*.hpp",
+    "include/metal/*.mm",
     "thirdparty/*.hpp",
 ]
 

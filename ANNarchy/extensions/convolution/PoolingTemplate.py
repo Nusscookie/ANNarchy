@@ -124,6 +124,8 @@ pooling_template_cuda = {
             size_t size_in_bytes = flat_coords.size() * sizeof(int);
 
             // Allocate and transfer to device
+            if (gpu_pre_coords != nullptr)
+                cudaFree(gpu_pre_coords);
             cudaMalloc((void**)&gpu_pre_coords, flat_coords.size()*sizeof(int));
             auto malloc_err = cudaGetLastError();
             if (malloc_err != cudaSuccess) {
@@ -201,7 +203,8 @@ cuda_pooling_code_2d_small_extent = {
                 if ( idx_y >= %(col_size)s )
                     continue;
 
-                local_%(pre_var)s = %(pre_var)s[ idx_x * %(col_size)s + idx_y ];
+                local_r = %(pre_var)s[ idx_x * %(col_size)s + idx_y ];
+%(apply_psp)s
 %(operation)s
             }
         }
@@ -218,18 +221,20 @@ cuda_pooling_code_2d_small_extent = {
     "psp_invoke": """
 void pooling_proj%(id_proj)s (RunConfig cfg, %(float_prec)s* psp, const int num_centers, const int* centers, const %(float_prec)s* %(pre_var)s) {
     cu_pooling_proj%(id_proj)s<<<cfg.nb, cfg.tpb, cfg.smem_size, cfg.stream>>>(
-        psp, num_centers, centers, %(pre_var_invoke)s
+        psp, num_centers, centers, %(pre_var)s
     );
 }
 """,
     "psp_header": """void pooling_proj%(id_proj)s (RunConfig cfg, %(float_prec)s* psp, const int num_centers, const int* centers, const %(float_prec)s* %(pre_var)s);
 """,
     "psp_call": """
-    int coords_per_block = floor(32.0 / static_cast<%(float_prec)s>(%(col_extent)s));
-    int num_blocks = ceil(static_cast<%(float_prec)s>(%(size_post)s) / static_cast<%(float_prec)s>(coords_per_block));
-    int thread_per_block = %(col_extent)s * coords_per_block;
-    int shared_mem_size = thread_per_block * sizeof(%(float_prec)s);
-    pooling_proj%(id_proj)s(RunConfig(num_blocks, thread_per_block, shared_mem_size, proj%(id_proj)s->stream), pop%(id_post)s->gpu__sum_%(target)s, %(size_post)s, proj%(id_proj)s->gpu_pre_coords, pop%(id_pre)s->gpu_%(pre_var)s );
+    if (proj%(id_proj)s->_transmission && pop%(id_post)s->_active ) {
+        int coords_per_block = floor(32.0 / static_cast<%(float_prec)s>(%(col_extent)s));
+        int num_blocks = ceil(static_cast<%(float_prec)s>(%(size_post)s) / static_cast<%(float_prec)s>(coords_per_block));
+        int thread_per_block = %(col_extent)s * coords_per_block;
+        int shared_mem_size = thread_per_block * sizeof(%(float_prec)s);
+        pooling_proj%(id_proj)s(RunConfig(num_blocks, thread_per_block, shared_mem_size, proj%(id_proj)s->stream), pop%(id_post)s->gpu__sum_%(target)s, %(size_post)s, proj%(id_proj)s->gpu_pre_coords, %(pre_array)s );
+    }
 """,
     # The reduction stage is responsible to fuse the several local results within
     # the warp to the final result. ATTENTION: there are several results in this warp
@@ -281,7 +286,8 @@ cuda_pooling_code_2d = {
                 if ( idx_y >= %(col_size)s )
                     continue;
 
-                local_%(pre_var)s = %(pre_var)s[ idx_x * %(col_size)s + idx_y ];
+                local_r = %(pre_var)s[ idx_x * %(col_size)s + idx_y ];
+%(apply_psp)s
 %(operation)s
             }
         }
@@ -307,10 +313,12 @@ void pooling_proj%(id_proj)s(RunConfig cfg, %(float_prec)s* psp, const int share
     # Technically, we could use more than warp-size threads.
     # But as we often have small extents it is not required (HD: 27. Nov. 2020)
     "psp_call": """
-    auto tpb = 32;
-    auto shared_size = min(32, tpb);
-    auto smem_size = 2 * shared_size * sizeof(%(float_prec)s);
-    pooling_proj%(id_proj)s(RunConfig(%(size_post)s, tpb, smem_size, proj%(id_projs).stream), pop%(id_post)s->gpu__sum_%(target)s, 2*shared_size, proj%(id_proj)s->gpu_pre_coords, pop%(id_pre)s->gpu_%(pre_var)s );
+    if (proj%(id_proj)s->_transmission && pop%(id_post)s->_active ) {
+        auto tpb = 32;
+        auto shared_size = std::min(32, tpb);
+        auto smem_size = 2 * shared_size * sizeof(%(float_prec)s);
+        pooling_proj%(id_proj)s(RunConfig(%(size_post)s, tpb, smem_size, proj%(id_proj)s->stream), pop%(id_post)s->gpu__sum_%(target)s, 2*shared_size, proj%(id_proj)s->gpu_pre_coords, %(pre_array)s );
+    }
 """,
     # The reduction stage is responsible to fuse the
     # several local results within the warp to the final result
@@ -374,7 +382,9 @@ if (tid == 0)
 
 cuda_pooling_code_3d = {
     "psp_body": """__global__ void pooling_proj%(id_proj)s ( %(float_prec)s* __restrict__ psp, const int* __restrict__ centers, const %(float_prec)s* __restrict__ %(pre_var)s) {
-    int bIdx = blockIdx.x;
+    // one thread per post-synaptic neuron
+    int bIdx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (bIdx >= %(size_post)s) return;
 
     int x_coords = centers[3*bIdx];
     int y_coords = centers[3*bIdx+1];
@@ -400,6 +410,7 @@ cuda_pooling_code_3d = {
                     continue;
 
                 local_r = %(pre_var)s[ %(plane_size)s * (%(col_size)s * idx_x + idx_y) + idx_z ];
+%(apply_psp)s
 %(operation)s
             }
         }
@@ -409,14 +420,14 @@ cuda_pooling_code_3d = {
 }
 """,
     "psp_invoke": """void pooling_proj%(id_proj)s(RunConfig cfg, %(float_prec)s* psp, const int* centers, const %(float_prec)s* %(pre_var)s) {
-    pooling_proj%(id_proj)s<<< %(size_post)s, 1 >>>(psp, centers, %(pre_var)s);
+    pooling_proj%(id_proj)s<<< cfg.nb, cfg.tpb, cfg.smem_size, cfg.stream >>>(psp, centers, %(pre_var)s);
 }
 """,
     "psp_header": """void pooling_proj%(id_proj)s(RunConfig cfg, %(float_prec)s* psp, const int* centers, const %(float_prec)s* %(pre_var)s);
 """,
     "psp_call": """
     if (proj%(id_proj)s->_transmission && pop%(id_post)s->_active ) {
-        pooling_proj%(id_proj)s(RunConfig(%(size_post)s, 1, 0, proj%(id_proj)s->stream), pop%(id_post)s->gpu__sum_%(target)s, proj%(id_proj)s->gpu_pre_coords, pop%(id_pre)s->gpu_%(pre_var)s );
+        pooling_proj%(id_proj)s(RunConfig((%(size_post)s + 127) / 128, 128, 0, proj%(id_proj)s->stream), pop%(id_post)s->gpu__sum_%(target)s, proj%(id_proj)s->gpu_pre_coords, %(pre_array)s );
 
     #ifndef NDEBUG
         auto proj%(id_proj)s_pool_err = cudaDeviceSynchronize();

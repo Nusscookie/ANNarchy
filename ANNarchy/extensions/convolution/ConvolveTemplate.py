@@ -112,6 +112,7 @@ convolve_template_cuda = {
         .def_rw("pre_coords_dirty", &ProjStruct%(id_proj)s::pre_coords_dirty)
         .def_rw("w", &ProjStruct%(id_proj)s::w)
         .def_rw("w_dirty", &ProjStruct%(id_proj)s::host_w_dirty)
+        %(delays)s
 
         // Other methods
         .def("size_in_bytes", &ProjStruct%(id_proj)s::size_in_bytes)
@@ -147,8 +148,11 @@ convolve_template_cuda = {
             auto flat_coords = transform_2d_to_1d<int>(pre_coords);
             size_t size_in_bytes = flat_coords.size() * sizeof(int);
 
+            if (gpu_pre_coords != nullptr)
+                cudaFree(gpu_pre_coords);
             cudaMalloc((void**)&gpu_pre_coords, size_in_bytes);
             cudaMemcpy(gpu_pre_coords, flat_coords.data(), size_in_bytes, cudaMemcpyHostToDevice);
+            pre_coords_dirty = false;
         }
 """,
     "device_host_transfer": "",
@@ -167,8 +171,8 @@ conv_filter_template = {
     "cuda": {
         "declare": """\t// Filter definition
     %(cpu_side_filter)s
-    %(float_prec)s *gpu_w;
-    bool host_w_dirty;
+    %(float_prec)s *gpu_w = nullptr;
+    bool host_w_dirty = false;
 """,
         "access": """
     // Local parameter w
@@ -189,6 +193,8 @@ conv_filter_template = {
             auto flat_data = transform_%(pre_dim)sd_to_1d<%(ctype)s>(w);
             auto size_in_bytes = flat_data.size() * sizeof(%(ctype)s);
 
+            if (gpu_w != nullptr)
+                cudaFree(gpu_w);
             cudaMalloc((void**)&gpu_w, size_in_bytes);
             auto malloc_err = cudaGetLastError();
             if (malloc_err != cudaSuccess) {
@@ -211,7 +217,9 @@ conv_filter_template = {
 
 cuda_convolution_single_filter = {
     "body": """__global__ void cu_conv_proj%(id_proj)s(%(float_prec)s* __restrict__ psp, const int* __restrict__ pre_coords, const %(float_prec)s* __restrict__ w%(pre_variables_header)s) {
-    int bIdx = blockIdx.x;
+    // one thread per post-synaptic neuron
+    int bIdx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (bIdx >= %(post_size)s) return;
     %(float_prec)s sum;
     int rk_pre, w_idx;
     const int *coord = &pre_coords[%(pre_dim)s*bIdx];
@@ -230,7 +238,7 @@ void convolution_proj%(id_proj)s(RunConfig cfg, %(float_prec)s* __restrict__ psp
     "call": """
     if (proj%(id_proj)s->_transmission && pop%(id_post)s->_active ) {
         convolution_proj%(id_proj)s(
-            RunConfig(pop%(id_post)s->size, 1, 0, proj%(id_proj)s->stream),
+            RunConfig((pop%(id_post)s->size + 127) / 128, 128, 0, proj%(id_proj)s->stream),
             pop%(id_post)s->gpu__sum_%(target)s, proj%(id_proj)s->gpu_pre_coords, proj%(id_proj)s->gpu_w%(pre_variables_call)s
         );
 
@@ -246,7 +254,9 @@ void convolution_proj%(id_proj)s(RunConfig cfg, %(float_prec)s* __restrict__ psp
 
 cuda_convolution_bank_of_filter = {
     "body": """__global__ void cu_conv_proj%(id_proj)s(%(float_prec)s* __restrict__ psp, const int* __restrict__ pre_coords, const %(float_prec)s* __restrict__ w%(pre_variables_header)s) {
-    int bIdx = blockIdx.x;
+    // one thread per post-synaptic neuron
+    int bIdx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (bIdx >= %(post_size)s) return;
     %(float_prec)s sum;
     int rk_pre, w_idx;
     const int *coord = &pre_coords[%(filter_dim)s*bIdx];
@@ -258,14 +268,14 @@ cuda_convolution_bank_of_filter = {
 }
 """,
     "invoke": """void convolution_proj%(id_proj)s(RunConfig cfg, %(float_prec)s* psp, const int* pre_coords, const %(float_prec)s* w%(pre_variables_header)s) {
-    cu_conv_proj%(id_projs)s<<<cfg.nb, cfg.tpb, cfg.smem_size, cfg.stream(psp, pre_coords, w%(pre_variables_invoke)s);
+    cu_conv_proj%(id_proj)s<<<cfg.nb, cfg.tpb, cfg.smem_size, cfg.stream>>>(psp, pre_coords, w%(pre_variables_invoke)s);
 }
 """,
     "header": "void convolution_proj%(id_proj)s(RunConfig cfg, %(float_prec)s* psp, const int* pre_coords, const %(float_prec)s* w%(pre_variables_header)s);",
     "call": """
     if (proj%(id_proj)s->_transmission && pop%(id_post)s->_active ) {
         convolution_proj%(id_proj)s(
-            RunConfig(pop%(id_post)s->size, 1, 0, proj%(id_proj)s->stream),
+            RunConfig((pop%(id_post)s->size + 127) / 128, 128, 0, proj%(id_proj)s->stream),
             pop%(id_post)s->gpu__sum_%(target)s, proj%(id_proj)s->gpu_pre_coords, proj%(id_proj)s->gpu_w%(pre_variables_call)s
         );
 
@@ -288,7 +298,7 @@ cuda_convolution_bank_of_filter_3d = {
     int w_idx = %(filter_dim_j)s*(i_w) + j_w;
 
     const int *coord = &pre_coords[3*bIdx];
-    const double *w_bank = &w[coord[2] * %(num_elem_filter)s];
+    const %(float_prec)s *w_bank = &w[coord[2] * %(num_elem_filter)s];
 
     int i_pre = coord[0] + (i_w - %(pre_offset_i)s);
     if ((i_pre < 0) || (i_pre > %(pre_border_i)s)) {
@@ -337,7 +347,7 @@ cuda_convolution_bank_of_filter_4d = {
     int rk_pre, w_idx;
 
     const int *coord = &pre_coords[4*bIdx];
-    const double *w_bank = &w[coord[3] * %(num_elem_filter)s];
+    const %(float_prec)s *w_bank = &w[coord[3] * %(num_elem_filter)s];
 
     int i_pre = coord[0] + (i_w - %(pre_offset_i)s);
     if ((i_pre < 0) || (i_pre > %(pre_border_i)s)) {

@@ -51,6 +51,11 @@ if _check_paradigm("openmp"):
     from .test_Convolution import test_Convolution
     from .test_Pooling import test_Pooling
 
+# The Metal paradigm supports convolution and pooling on the GPU
+if _check_paradigm("metal"):
+    from .test_Convolution import test_Convolution
+    from .test_Pooling import test_Pooling
+
 # Contains mapping which formats are allowed for which operation
 from .storage_formats import single_thread, open_mp, cuda
 

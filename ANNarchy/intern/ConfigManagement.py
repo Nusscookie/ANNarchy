@@ -7,9 +7,12 @@ from typing import Union
 import copy
 import numpy
 
-from ANNarchy.core.CTypes import float64
+from ANNarchy.core.CTypes import float32, float64
 from ANNarchy.intern.NetworkManager import NetworkManager
 from ANNarchy.intern import Messages
+
+# Code generation backends accepted by the paradigm flag
+available_paradigms = ["openmp", "cuda", "metal"]
 
 default_config = dict(
     # Simulation Control
@@ -123,10 +126,24 @@ class ConfigManager:
         Updates the configuration for entry *key* with a new *value*.
         If the key does not exist a terminating exception is raised.
         """
+        if key == "paradigm" and value not in available_paradigms:
+            Messages.error(
+                f"Unknown paradigm '{value}'. Accepted values: {', '.join(available_paradigms)}."
+            )
+
         if key in self.keys():
             self._config[net_id][key] = value
         else:
             raise KeyError
+
+        # Metal GPUs do not support double precision. The data type needs to be
+        # set before the neuron and synapse models are analysed, i.e. before
+        # populations and projections are created.
+        if key == "paradigm" and value == "metal" and self._config[net_id]["dtype"] != float32:
+            self._config[net_id]["dtype"] = float32
+            Messages.info("The Metal paradigm uses single precision (dtype=float32).")
+        if key == "dtype" and value != float32 and self._config[net_id]["paradigm"] == "metal":
+            Messages.error("The Metal paradigm only supports dtype=float32, as Metal GPUs have no double precision.")
 
     def keys(self) -> list:
         "Returns the list of keys that can be set with setup."
@@ -143,7 +160,7 @@ def setup(**keyValueArgs):
     It takes various optional arguments. The most useful ones are:
 
     * `dt`: simulation step size in milliseconds (default: 1.0).
-    * `paradigm`: parallel framework for code generation. Accepted values: "openmp" or "cuda" (default: "openmp").
+    * `paradigm`: parallel framework for code generation. Accepted values: "openmp", "cuda" or "metal" (Apple GPUs, macOS only; implies float32) (default: "openmp").
     * `method`: default method to numerize ODEs. Default is the explicit forward Euler method ('explicit').
     * `precision`: default floating precision for variables in ANNarchy. Accepted values: "float" or "double" (default: "double")
     * `structural_plasticity`: allows synapses to be dynamically added/removed during the simulation (default: False).
@@ -311,11 +328,21 @@ def _check_paradigm(paradigm, net_id=0):
 
     1. "openmp"
     2. "cuda"
+    3. "metal"
+
+    The Metal backend is built on top of the CUDA code generators (the generated
+    CUDA kernels are translated into Metal shaders), so _check_paradigm("cuda")
+    is also True when the Metal paradigm is used. Use _check_paradigm("metal")
+    to distinguish the two.
     """
     try:
-        return paradigm == ConfigManager().get("paradigm", net_id)
+        used_paradigm = ConfigManager().get("paradigm", net_id)
     except KeyError:
         Messages.error("Unknown paradigm")
+
+    if paradigm == "cuda" and used_paradigm == "metal":
+        return True
+    return paradigm == used_paradigm
 
 
 def _check_precision(precision, net_id=0):

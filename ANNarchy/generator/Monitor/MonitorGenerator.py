@@ -4,13 +4,14 @@
 """
 
 from ANNarchy.intern.NetworkManager import NetworkManager
-from ANNarchy.intern.ConfigManagement import ConfigManager
+from ANNarchy.intern.ConfigManagement import ConfigManager, _check_paradigm
 from ANNarchy.generator.Monitor import BaseTemplates as RecTemplate
 from ANNarchy.generator.Utils import tabify
 from ANNarchy.extensions.bold import BoldMonitor
 
 from ANNarchy.generator.Monitor import OpenMPTemplates
 from ANNarchy.generator.Monitor import CUDATemplates
+from ANNarchy.generator.Monitor import MetalTemplates
 
 
 class MonitorGenerator(object):
@@ -92,12 +93,17 @@ class MonitorGenerator(object):
         """
         if ConfigManager().get("paradigm", self.net_id) == "openmp":
             template = OpenMPTemplates.omp_population
-        elif ConfigManager().get("paradigm", self.net_id) == "cuda":
+        elif _check_paradigm("metal", self.net_id):
+            template = MetalTemplates.metal_population
+        elif _check_paradigm("cuda", self.net_id):
             template = CUDATemplates.cuda_population
         else:
             raise NotImplementedError
 
         tpl_code = template["template"]
+
+        # Metal: deferred copies of the recorded data (local variables only)
+        finalize_code = ""
 
         init_code = ""
         recording_code = ""
@@ -136,6 +142,8 @@ class MonitorGenerator(object):
                 struct_code += template["local"]["struct"] % tar_dict
                 init_code += template["local"]["init"] % tar_dict
                 recording_target_code += template["local"]["recording"] % tar_dict
+                if "finalize" in template["local"]:
+                    finalize_code += template["local"]["finalize"] % tar_dict
                 clear_all_code += "\t\tthis->clear_{name}();\n".format(
                     name="_sum_" + target
                 )
@@ -150,6 +158,8 @@ class MonitorGenerator(object):
                 struct_code += template["local"]["struct"] % tar_dict
                 init_code += template["local"]["init"] % tar_dict
                 recording_target_code += template["local"]["recording"] % tar_dict
+                if "finalize" in template["local"]:
+                    finalize_code += template["local"]["finalize"] % tar_dict
                 clear_all_code += "\t\tthis->clear_{name}();\n".format(
                     name="g_" + target
                 )
@@ -174,6 +184,8 @@ class MonitorGenerator(object):
             struct_code += template[var["locality"]]["struct"] % ids
             init_code += template[var["locality"]]["init"] % ids
             recording_code += template[var["locality"]]["recording"] % ids
+            if "finalize" in template[var["locality"]]:
+                finalize_code += template[var["locality"]]["finalize"] % ids
             clear_all_code += "\t\tthis->clear_{name}();\n".format(name=ids["name"])
             clear_individual_code += template[var["locality"]]["clear"] % ids
             size_in_bytes_code += template[var["locality"]]["size_in_bytes"] % ids
@@ -194,11 +206,11 @@ class MonitorGenerator(object):
             struct_code += base_tpl["struct"] % rec_dict
             init_code += base_tpl["init"] % rec_dict
             recording_code += (
-                base_tpl["record"][ConfigManager().get("paradigm", self.net_id)]
+                base_tpl["record"]["cuda" if _check_paradigm("cuda", self.net_id) else "openmp"]
                 % rec_dict
             )
             size_in_bytes_code += (
-                base_tpl["size_in_bytes"][ConfigManager().get("paradigm", self.net_id)]
+                base_tpl["size_in_bytes"]["cuda" if _check_paradigm("cuda", self.net_id) else "openmp"]
                 % rec_dict
             )
             clear_all_code += "\t\tthis->clear_spike();\n"
@@ -215,7 +227,7 @@ class MonitorGenerator(object):
                 struct_code += base_tpl["struct"] % rec_dict
                 init_code += base_tpl["init"] % rec_dict
                 recording_code += (
-                    base_tpl["record"][ConfigManager().get("paradigm", self.net_id)]
+                    base_tpl["record"]["cuda" if _check_paradigm("cuda", self.net_id) else "openmp"]
                     % rec_dict
                 )
 
@@ -229,6 +241,7 @@ class MonitorGenerator(object):
             "size_in_bytes_estimate_code": tabify(size_in_bytes_estimate_code, 2),
             "clear_all_container_code": clear_all_code,
             "clear_individual_container_code": clear_individual_code,
+            "finalize_code": finalize_code,
         }
         return tpl_code % ids
 
@@ -246,7 +259,7 @@ class MonitorGenerator(object):
         """
         if ConfigManager().get("paradigm", self.net_id) == "openmp":
             template = OpenMPTemplates.omp_projection
-        elif ConfigManager().get("paradigm", self.net_id) == "cuda":
+        elif _check_paradigm("cuda", self.net_id):
             template = CUDATemplates.cuda_projection
         else:
             raise NotImplementedError

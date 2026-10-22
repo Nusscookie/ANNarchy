@@ -34,6 +34,11 @@ public:
     virtual void record_targets() = 0;
 
     /**
+     *  @brief      called at the end of simulate(), e.g. to collect data recorded on GPUs.
+     */
+    virtual void finalize() {}
+
+    /**
      *  @brief      compute an estimate of allocated memory.
      *  @details    not exported to python
      *  @return     number of allocated bytes.

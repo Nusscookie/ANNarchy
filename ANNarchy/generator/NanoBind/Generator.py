@@ -169,7 +169,7 @@ class NanoBindGenerator:
 
         # Type-specific functions
         if pop.neuron_type.type == "spike":
-            additional_func += """\t\t.def("compute_firing_rate", [](PopStruct%(id)s& obj, %(py_float_prec)s window) {return obj.compute_firing_rate(%(cpp_float_prec)s{window});} )\n""" % {'id': pop.id, 'py_float_prec': default_float_type.py_decl_type, 'cpp_float_prec': default_float_type.cpp_decl_type}
+            additional_func += """\t\t.def("compute_firing_rate", [](PopStruct%(id)s& obj, %(py_float_prec)s window) {return obj.compute_firing_rate(static_cast<%(cpp_float_prec)s>(window));} )\n""" % {'id': pop.id, 'py_float_prec': default_float_type.py_decl_type, 'cpp_float_prec': default_float_type.cpp_decl_type}
 
             if pop.neuron_type.refractory or pop.refractory:
                 additional_func += (
@@ -317,12 +317,12 @@ class NanoBindGenerator:
 
             if attr['locality'] == "local":
                 conversion_code = """
-                        std::vector<%(target_float_prec)s> result;
+                        std::vector< std::vector<%(target_float_prec)s> > result;
+                        result.reserve(obj.%(name)s.size());
 
-                        // convert row-by-row into target
+                        // convert row-by-row into target (one row per recorded step)
                         for (const auto& %(name)s_row : obj.%(name)s)
-                            for (%(source_float_prec)s %(name)s_item : %(name)s_row)
-                                result.push_back(static_cast<%(target_float_prec)s>(%(name)s_item));
+                            result.emplace_back(%(name)s_row.begin(), %(name)s_row.end());
                         return result;
 """ % ids
             else:

@@ -4,7 +4,7 @@
 """
 
 from ANNarchy.core.Projection import Projection
-from ANNarchy.intern.ConfigManagement import ConfigManager
+from ANNarchy.intern.ConfigManagement import ConfigManager, _check_paradigm
 
 
 class SpecificProjection(Projection):
@@ -47,7 +47,7 @@ class SpecificProjection(Projection):
                 self._generate_st()
             else:
                 self._generate_omp()
-        elif ConfigManager().get("paradigm", self.net_id) == "cuda":
+        elif _check_paradigm("cuda", self.net_id):
             self._generate_cuda()
         else:
             raise NotImplementedError

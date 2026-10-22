@@ -49,7 +49,7 @@ pop_attr_accessor_local = """
         assert(obj.%(name)s.size() == values.size());
 
         for (size_t i = 0; i < obj.%(name)s.size(); ++i)
-            obj.%(name)s[i] = %(cpp_float_prec)s{values[i]};
+            obj.%(name)s[i] = static_cast<%(cpp_float_prec)s>(values[i]);
     }
 )"""
 

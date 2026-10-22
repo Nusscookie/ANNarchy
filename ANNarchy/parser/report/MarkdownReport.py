@@ -93,6 +93,8 @@ def _generate_summary(net_id):
     backend = "default"
     if ConfigManager().get("paradigm", net_id) == "cuda":
         backend = "CUDA"
+    elif ConfigManager().get("paradigm", net_id) == "metal":
+        backend = "Metal"
     elif (
         ConfigManager().get("paradigm", net_id) == "openmp"
         and ConfigManager().get("num_threads", net_id) > 1

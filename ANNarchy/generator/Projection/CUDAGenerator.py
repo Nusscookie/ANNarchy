@@ -1255,7 +1255,11 @@ if(%(condition)s){
                     }
                     kernel_args_decl += ", %(type)s* __restrict__ pre_%(name)s" % ids
                     kernel_args_invoke += ", pre_%(name)s" % ids
-                    kernel_args_call += ", pop%(id)s->gpu_%(name)s" % ids
+                    if proj.synapse_type.type == "rate" and proj.max_delay > 1:
+                        # as for the CPU implementations, the learning rules use the delayed pre-synaptic variables
+                        kernel_args_call += ", pop%(id)s->gpu_delayed_%(name)s[proj%(id_proj)s->delay-1]" % dict(ids, id_proj=proj.id)
+                    else:
+                        kernel_args_call += ", pop%(id)s->gpu_%(name)s" % ids
 
                 if dep in proj.synapse_type.description["dependencies"]["post"]:
                     attr_type, attr_dict = PopulationGenerator._get_attr_and_type(
@@ -1387,7 +1391,7 @@ if(%(condition)s){
             # TODO: improve code
             if _check_precision("float", self._net_id):
                 device_code += cpp_func.replace(
-                    "float" + func["name"],
+                    "float " + func["name"],
                     "__device__ float proj%(id)s_%(func)s"
                     % {"id": proj.id, "func": func["name"]},
                 )

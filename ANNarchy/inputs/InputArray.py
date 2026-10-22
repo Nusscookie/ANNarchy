@@ -3,6 +3,7 @@
 :license: GPLv2, see LICENSE for details.
 """
 import numpy
+from ANNarchy.intern.ConfigManagement import _check_paradigm
 
 from ANNarchy.core.Neuron import Neuron
 from ANNarchy.intern import Messages
@@ -92,6 +93,9 @@ class InputArray(SpecificPopulation):
         # Update values
         if self.initialized:
             self.cyInstance.r = r
+            if _check_paradigm("cuda", self.net_id):
+                # triggers host-to-device transfer at begin of simulate()
+                self.cyInstance.r_host_to_device = True
         else:
             self.init["r"] = r
 

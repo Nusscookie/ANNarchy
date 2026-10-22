@@ -1043,7 +1043,7 @@ class Network(metaclass=NetworkMeta):
         It takes various optional arguments. The most useful ones are:
 
         * `dt`: simulation step size in milliseconds (default: 1.0).
-        * `paradigm`: parallel framework for code generation. Accepted values: "openmp" or "cuda" (default: "openmp").
+        * `paradigm`: parallel framework for code generation. Accepted values: "openmp", "cuda" or "metal" (Apple GPUs, macOS only; implies float32) (default: "openmp").
         * `method`: default method to numerize the ODEs. Default is the explicit forward Euler method ('explicit').
         * `dtype`: default data type used for attributes in ANNarchy. Accepted values, available on the top-level of the ANNarchy package: float32 or float64 (default: float64).
         * `structural_plasticity`: allows synapses to be dynamically added/removed during the simulation (default: False).
@@ -1071,7 +1071,9 @@ class Network(metaclass=NetworkMeta):
         if 'dtype' in kwargs:
             dtype = kwargs.pop("dtype")
             paradigm = kwargs.pop("paradigm", self._get_config("paradigm"))
-            if dtype == ANNarchyFloatTypes.bfloat16 and paradigm != "cuda":
+            if paradigm == "metal" and dtype != ANNarchyFloatTypes.float32:
+                Messages.error("The Metal paradigm only supports dtype=float32, as Metal GPUs have no double precision.")
+            elif dtype == ANNarchyFloatTypes.bfloat16 and paradigm != "cuda":
                 Messages.error("using bfloat16 is only valid for GPU devices.")
             elif dtype == ANNarchyFloatTypes.float16 and paradigm != "cuda":
                 Messages.error("using float16 is only valid for GPU devices.")

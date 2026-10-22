@@ -16,7 +16,8 @@ from ANNarchy.generator.Monitor.MonitorGenerator import MonitorGenerator
 from ANNarchy.generator.SimCore import (
     SingleThreadSimCoreGenerator,
     OpenMPSimCoreGenerator,
-    CUDASimCoreGenerator
+    CUDASimCoreGenerator,
+    MetalSimCoreGenerator,
 )
 from ANNarchy.generator.Population import (
     SingleThreadGenerator,
@@ -71,7 +72,9 @@ class CodeGenerator(object):
         # Profiling is optional, but if either Global.config["profiling"] set to True
         # or --profile was added on command line.
         if self._network._profiler is not None:
-            if ConfigManager().get("paradigm", self.net_id) == "openmp":
+            if _check_paradigm("metal", self.net_id):
+                Messages.error("Profiling is not supported yet for the Metal paradigm.")
+            elif ConfigManager().get("paradigm", self.net_id) == "openmp":
                 self._profgen = Profile.CPP11Profile(self._annarchy_dir, net_id)
                 self._profgen.generate()
             elif ConfigManager().get("paradigm", self.net_id) == "cuda":
@@ -95,6 +98,15 @@ class CodeGenerator(object):
                 self._popgen = OpenMPGenerator(self._profgen, net_id)
                 self._projgen = OpenMPProjectionGenerator(self._profgen, net_id)
                 self._core_gen = OpenMPSimCoreGenerator(self._profgen, net_id)
+
+        elif _check_paradigm("metal", self.net_id):
+            # The Metal backend translates the code generated for CUDA, the
+            # CUDA version only influences workarounds for very old CUDA SDKs.
+            self._popgen = CUDAGenerator(12.0, self._profgen, net_id)
+            self._projgen = CUDAProjectionGenerator(12.0, self._profgen, net_id)
+            self._core_gen = MetalSimCoreGenerator(
+                self._cuda_config, self._profgen, net_id
+            )
 
         elif ConfigManager().get("paradigm", self.net_id) == "cuda":
             self._popgen = CUDAGenerator(
@@ -147,6 +159,8 @@ class CodeGenerator(object):
                     print("\nGenerate sequential code ...")
             elif ConfigManager().get("paradigm", self.net_id) == "cuda":
                 print("\nGenerate CUDA code ...")
+            elif ConfigManager().get("paradigm", self.net_id) == "metal":
+                print("\nGenerate Metal code ...")
             else:
                 raise NotImplementedError
 

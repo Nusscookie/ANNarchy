@@ -6,4 +6,6 @@ include ANNarchy/cython_ext/*.pxd
 exclude ANNarchy/cython_ext/*.cpp
 exclude ANNarchy/cython_ext/*.so
 include ANNarchy/include/*.hpp
+include ANNarchy/include/*.cuh
+include ANNarchy/include/metal/*
 include ANNarchy/thirdparty/*.hpp
