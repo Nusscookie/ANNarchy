@@ -3,6 +3,7 @@
 :license: GPLv2, see LICENSE for details.
 """
 
+import os
 import numpy as np
 from copy import deepcopy
 
@@ -20,6 +21,7 @@ from ANNarchy.extensions.convolution.ConvolveTemplate import (
     cuda_convolution_bank_of_filter_4d,
     cuda_convolution_single_filter
 )
+from ANNarchy.extensions.convolution import MetalConvolveTemplate
 from ANNarchy.extensions.convolution.Utils import SharedSynapse
 
 # Indices used for each dimension
@@ -511,6 +513,11 @@ class Convolution(SpecificProjection):
             # triggers host-to-device transfer at begin of simulate()
             self.cyInstance.w_dirty = True
 
+        # Metal kernels: start index of each window in the padded pre-synaptic copy
+        if getattr(self, "_metal_plan", None) is not None:
+            self.cyInstance.pre_base = self._metal_plan["pre_base"]
+            self.cyInstance.pre_base_dirty = True
+
         # Set delays after instantiation
         if self.delays > 0.0:
             self.cyInstance.set_delay(
@@ -954,6 +961,7 @@ class Convolution(SpecificProjection):
             "pre_variables_call": pre_variables_call,
             "pre_variable": "pre_%(name)s" % pre_id_dict,
             "post_size": self.post.size,
+            "sum_code": sum_code,
         }
 
         # Finalize the processing code
@@ -983,8 +991,8 @@ class Convolution(SpecificProjection):
             # Bank of filters: the specialized kernels use one thread per filter
             # element, which is limited by the maximal threadgroup size
             threads_per_filter = int(np.prod(self.weights.shape[1:]))
-            # ... and they implement only the default psp (w * pre.r)
-            default_psp = self.synapse_type.psp.replace(" ", "") in ["w*pre.r", "pre.r*w"]
+            # ... and they implement only the default psp (w * pre.r) and the sum
+            default_psp = self.synapse_type.psp.replace(" ", "") in ["w*pre.r", "pre.r*w"] and self.synapse_type.operation == "sum"
             if len(self.weights.shape) == 3 and len(self.pre.geometry) == 2 and threads_per_filter <= 1024 and default_psp:
                 code_ids.update(
                     {
@@ -1055,6 +1063,11 @@ class Convolution(SpecificProjection):
                     cuda_convolution_bank_of_filter["call"] % code_ids
                 )
 
+        # Apple GPUs: kernels tuned for Metal, if applicable
+        self._metal_plan = None
+        if _check_paradigm("metal", self.net_id):
+            self._generate_metal(code_ids)
+
         # Post-neuron is a spike neuron (e.g., part of ANN-to-SNN conversion)
         if self.post.neuron_type.type == "spike":
             self._specific_template["psp_call"] = self._specific_template[
@@ -1064,6 +1077,269 @@ class Convolution(SpecificProjection):
         # Remove trailing spaces
         self._specific_template["psp_body"] = remove_trailing_spaces(
             self._specific_template["psp_body"]
+        )
+
+    ################################
+    ### Metal kernels
+    ################################
+    def _metal_psp_factor(self):
+        """
+        Returns f if the psp has the form f(pre) * w (as C++ code using
+        pre_<var>[rk_pre]), otherwise None.
+        """
+        psp = self.synapse_type.description["psp"]["cpp"] % {
+            "id_pre": self.pre.id,
+            "id_post": self.post.id,
+            "local_index": "[w_idx]",
+            "global_index": "",
+            "pre_index": "[rk_pre]",
+            "post_index": "",
+            "pre_prefix": "pre_",
+            "post_prefix": "post_",
+        }
+        psp = psp.strip().rstrip(";").strip()
+
+        def strip_parentheses(expr):
+            while expr.startswith("(") and expr.endswith(")"):
+                depth = 0
+                for i, c in enumerate(expr):
+                    depth += c == "("
+                    depth -= c == ")"
+                    if depth == 0 and i < len(expr) - 1:
+                        return expr
+                expr = expr[1:-1].strip()
+            return expr
+
+        # split the product into its top-level factors
+        expr = strip_parentheses(psp)
+        factors, depth, current = [], 0, ""
+        for c in expr:
+            if c in "([":
+                depth += 1
+            elif c in ")]":
+                depth -= 1
+            elif depth == 0 and c in "+-/%?:<>=&|!":
+                return None
+            if depth == 0 and c == "*":
+                factors.append(current.strip())
+                current = ""
+            else:
+                current += c
+        factors.append(current.strip())
+
+        factors = [strip_parentheses(f) for f in factors]
+        if factors.count("w[w_idx]") != 1:
+            return None
+        factors.remove("w[w_idx]")
+        f = "*".join("(" + f + ")" for f in factors) if factors else "1.0"
+        if "w[" in f or "w_idx" in f or "post_" in f:
+            return None
+        return f
+
+    def _metal_conv_plan(self):
+        """
+        Checks if the Metal kernels can be used and computes the layout of the
+        zero-padded pre-synaptic copy. Returns None if not applicable.
+        """
+        if isinstance(self.padding, str) or float(self.padding) != 0.0:
+            return None
+        if self.synapse_type.operation not in ["sum", "mean", "max", "min"]:
+            return None
+
+        filter_shape = tuple(self.weights.shape[1:]) if self.multiple else tuple(self.weights.shape)
+        num_filters = self.weights.shape[0] if self.multiple else 1
+        pre_geometry = tuple(int(g) for g in self.pre.geometry)
+        dim_pre = len(pre_geometry)
+        dim_filter = len(filter_shape)
+
+        # the filter covers all dimensions, or all but the last (keep_last_dimension)
+        if dim_filter == dim_pre - 1:
+            if self.multiple or not self.keep_last_dimension:
+                return None
+        elif dim_filter != dim_pre:
+            return None
+
+        psp_pre = self._metal_psp_factor()
+        if psp_pre is None:
+            return None
+
+        coords = np.asarray(self.pre_coordinates, dtype=np.int64)
+        if coords.ndim != 2 or coords.shape[0] != self.post.size or self.post.size % num_filters != 0:
+            return None
+        if self.multiple:
+            # post-synaptic rank = position * num_filters + filter
+            if not np.array_equal(coords[:, dim_pre], np.tile(np.arange(num_filters), self.post.size // num_filters)):
+                return None
+            coords = coords[::num_filters]
+        coords = coords[:, :dim_pre]
+        if np.any(coords < 0) or np.any(coords >= np.array(pre_geometry)):
+            return None
+
+        # zero-padding needed in each dimension
+        lower, padded_geometry = [], []
+        for d in range(dim_pre):
+            if d < dim_filter:
+                center = self._center_filter(filter_shape[d])
+                lo = max(0, center - int(coords[:, d].min()))
+                hi = max(0, int(coords[:, d].max()) + filter_shape[d] - 1 - center - (pre_geometry[d] - 1))
+            else:
+                center, lo, hi = 0, 0, 0
+            lower.append(lo - center)
+            padded_geometry.append(pre_geometry[d] + lo + hi)
+
+        padded_size = int(np.prod(padded_geometry))
+        if padded_size >= 2**31:
+            return None
+        strides = [int(np.prod(padded_geometry[d + 1:])) for d in range(dim_pre)]
+
+        # start index of the window of each position
+        pre_base = np.zeros(coords.shape[0], dtype=np.int64)
+        for d in range(dim_pre):
+            pre_base += (coords[:, d] + lower[d]) * strides[d]
+
+        return {
+            "filter_shape": filter_shape,
+            "num_filters": num_filters,
+            "pre_geometry": pre_geometry,
+            "padded_size": padded_size,
+            "offset_pre": [lower[d] + (self._center_filter(filter_shape[d]) if d < dim_filter else 0) for d in range(dim_pre)],
+            "strides": strides,
+            "psp_pre": psp_pre,
+            "pre_base": pre_base.astype(np.int32).tolist(),
+        }
+
+    def _generate_metal(self, code_ids):
+        """
+        Replaces the CUDA kernels by the kernels tuned for Apple GPUs, see
+        MetalConvolveTemplate.py.
+        """
+        plan = self._metal_conv_plan()
+        if plan is None:
+            return
+        self._metal_plan = plan
+
+        float_prec = ConfigManager().get("precision", self.net_id)
+        filter_shape = plan["filter_shape"]
+        num_positions = self.post.size // plan["num_filters"]
+
+        # If the innermost dimension of the filter is contiguous in memory and
+        # a multiple of 4, it is processed with vector loads.
+        dim_filter = len(filter_shape)
+        vectorize = (
+            dim_filter == len(plan["pre_geometry"])
+            and filter_shape[-1] % 4 == 0
+            and os.environ.get("ANNARCHY_METAL_CONV_VECTORIZE", "1") == "1"
+        )
+
+        # Work per thread (measured on an M5 Pro): up to 8 filters (each loaded
+        # pre-synaptic value is reused) and 1-3 positions (each loaded weight is
+        # reused), without running out of registers. With few threads, the
+        # window is split among 2-8 threads of a SIMD-group to keep the GPU busy.
+        num_filters = plan["num_filters"]
+        filters_per_thread = max(f for f in range(1, min(8, num_filters) + 1) if num_filters % f == 0)
+        num_outputs = num_positions * num_filters
+        if vectorize and filters_per_thread >= 2:
+            outputs_per_thread = 2
+        elif filters_per_thread >= 8 and np.prod(filter_shape) >= 1024:
+            outputs_per_thread = 3
+        elif filters_per_thread >= 4 or num_outputs >= 2 * 32768:
+            outputs_per_thread = 2
+        else:
+            outputs_per_thread = 1
+        outputs_per_thread = int(os.environ.get("ANNARCHY_METAL_CONV_OUTPUTS", outputs_per_thread))
+        filters_per_thread = int(os.environ.get("ANNARCHY_METAL_CONV_FILTERS", filters_per_thread))
+        num_threads = (num_positions + outputs_per_thread - 1) // outputs_per_thread
+        window_parts = 1
+        while (
+            num_threads * (num_filters // filters_per_thread) * window_parts < 15000
+            and window_parts < 8
+            and 2 * window_parts <= filter_shape[0]
+        ):
+            window_parts *= 2
+        window_parts = int(os.environ.get("ANNARCHY_METAL_CONV_PARTS", window_parts))
+
+        # pre-synaptic rank -> index in the padded copy
+        padded_index_code = ""
+        for d in reversed(range(len(plan["pre_geometry"]))):
+            padded_index_code += "    padded_idx += (idx %% %(g)s + %(o)s) * %(s)s; idx /= %(g)s;\n" % {
+                "g": plan["pre_geometry"][d],
+                "o": plan["offset_pre"][d],
+                "s": plan["strides"][d],
+            }
+
+        # loops over the filter, the outermost dimension is split into window_parts
+        accumulate = MetalConvolveTemplate.metal_conv_accumulate[self.synapse_type.operation]
+        vtype = "float4" if vectorize else float_prec
+        loop_code = ""
+        offset, weight_index = [], ""
+        for d, size in enumerate(filter_shape):
+            step = 4 if (vectorize and d == dim_filter - 1) else 1
+            if d == 0:
+                start_idx, step = "part", window_parts * step
+            else:
+                start_idx = "0"
+            loop_code += tabify("for (int i%(d)s = %(start)s; i%(d)s < %(size)s; i%(d)s += %(step)s) {\n" % {"d": d, "start": start_idx, "size": size, "step": step}, d + 1)
+            offset.append("i%(d)s * %(s)s" % {"d": d, "s": plan["strides"][d]})
+            weight_index = "i0" if d == 0 else "(%s) * %s + i%s" % (weight_index, size, d)
+        depth = dim_filter + 1
+        load = (lambda expr: "annmtl_load4(&%s)" % expr) if vectorize else (lambda expr: expr)
+        loop_code += tabify("const int offset = %s;\n" % " + ".join(offset), depth)
+        loop_code += tabify("const int w_idx = %s;\n" % weight_index, depth)
+        loop_code += tabify("%s x[%d];\n" % (vtype, outputs_per_thread), depth)
+        loop_code += tabify("for (int r = 0; r < %d; r++)\n" % outputs_per_thread, depth)
+        loop_code += tabify("x[r] = %s;\n" % load("padded[base[r] + offset]"), depth + 1)
+        loop_code += tabify("for (int f = 0; f < %d; f++) {\n" % filters_per_thread, depth)
+        loop_code += tabify("const %s weight = %s;\n" % (vtype, load("w_group[f * %d + w_idx]" % int(np.prod(filter_shape)))), depth + 1)
+        loop_code += tabify("for (int r = 0; r < %d; r++)\n" % outputs_per_thread, depth + 1)
+        if vectorize:
+            statement = MetalConvolveTemplate.metal_conv_accumulate4[self.synapse_type.operation] % {
+                "a": "acc[r * %d + f]" % filters_per_thread, "x": "x[r]", "w": "weight", "float_prec": float_prec
+            }
+        else:
+            statement = accumulate % {"a": "acc[r * %d + f]" % filters_per_thread, "v": "x[r] * weight", "float_prec": float_prec}
+        loop_code += tabify(statement + "\n", depth + 2)
+        loop_code += tabify("}\n", depth)
+        for d in reversed(range(dim_filter)):
+            loop_code += tabify("}\n", d + 1)
+
+        # combine the parts of the window
+        reduction_code = ""
+        if window_parts > 1:
+            reduction_code = tabify("for (int a = 0; a < %d; a++) {\n" % (outputs_per_thread * filters_per_thread), 1)
+            reduction_code += tabify("for (int lane_mask = %d; lane_mask > 0; lane_mask /= 2) {\n" % (window_parts // 2), 2)
+            reduction_code += tabify("%s other = __shfl_xor_sync(0xffffffff, acc[a], lane_mask);\n" % float_prec, 3)
+            reduction_code += tabify(accumulate % {"a": "acc[a]", "v": "other", "float_prec": float_prec} + "\n", 3)
+            reduction_code += tabify("}\n", 2)
+            reduction_code += tabify("}\n", 1)
+
+        ids = dict(code_ids)
+        ids.update(
+            {
+                "pre_size": self.pre.size,
+                "padded_index_code": padded_index_code,
+                "psp_pre": "(%s)(%s)" % (float_prec, plan["psp_pre"]),
+                "filter_size": int(np.prod(filter_shape)),
+                "num_filters": plan["num_filters"],
+                "num_positions": num_positions,
+                "num_threads": num_threads,
+                "outputs_per_thread": outputs_per_thread,
+                "filters_per_thread": filters_per_thread,
+                "window_parts": window_parts,
+                "num_acc": outputs_per_thread * filters_per_thread,
+                "loop_code": loop_code,
+                "reduction_code": reduction_code,
+                "sum_code": code_ids["sum_code"].replace("sum", "acc[r * %d + f]" % filters_per_thread),
+                "padded_size": plan["padded_size"],
+            }
+        )
+        for key in ["body", "invoke", "header", "call"]:
+            self._specific_template["psp_" + key] = MetalConvolveTemplate.metal_conv[key] % ids
+
+        self._specific_template["declare_connectivity_matrix"] += MetalConvolveTemplate.metal_conv_declare % ids
+        self._specific_template["host_device_transfer"] += MetalConvolveTemplate.metal_conv_transfer % ids
+        self._specific_template["clear_container"] += MetalConvolveTemplate.metal_conv_clear
+        self._specific_template["wrapper"] = self._specific_template["wrapper"].replace(
+            "        // Other methods", MetalConvolveTemplate.metal_conv_wrapper % ids + "\n        // Other methods"
         )
 
     ################################

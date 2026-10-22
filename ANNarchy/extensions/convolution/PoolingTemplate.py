@@ -264,7 +264,7 @@ cuda_pooling_code_2d = {
 
     // shared storage need to be initialized
     extern %(float_prec)s __shared__ sdata[];
-    for(int x = tid; x < shared_size; x++)
+    for(int x = tid; x < shared_size; x += blockDim.x)
         sdata[x] = %(sum_default)s;
     __syncthreads();
 

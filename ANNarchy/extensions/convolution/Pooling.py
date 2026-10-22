@@ -5,9 +5,12 @@
 
 from copy import deepcopy
 
+import numpy as np
+
 from ANNarchy.intern.SpecificProjection import SpecificProjection
 from ANNarchy.intern.ConfigManagement import ConfigManager, _check_paradigm
 from ANNarchy.intern import Messages
+from ANNarchy.extensions.convolution import MetalPoolingTemplate
 
 from ANNarchy.generator.Utils import tabify, remove_trailing_spaces
 from ANNarchy.extensions.convolution.PoolingTemplate import (
@@ -234,6 +237,11 @@ class Pooling(SpecificProjection):
         if _check_paradigm("cuda", self.net_id):
             # triggers host-to-device transfer at begin of simulate()
             self.cyInstance.pre_coords_dirty = True
+
+        # Metal kernel: start index of each pooling window
+        if getattr(self, "_metal_pre_base", None) is not None:
+            self.cyInstance.pre_base = self._metal_pre_base
+            self.cyInstance.pre_base_dirty = True
 
         return True
 
@@ -748,6 +756,13 @@ class Pooling(SpecificProjection):
         else:
             raise NotImplementedError
 
+        # Apple GPUs: kernel tuned for Metal, if applicable
+        self._metal_pre_base = None
+        if _check_paradigm("metal", self.net_id):
+            metal_template = self._generate_metal(base_ids, sum_default, final_result)
+            if metal_template is not None:
+                pool_template = metal_template
+
         # Post-neuron is a spike neuron (e.g., part of ANN-to-SNN conversion)
         if self.post.neuron_type.type == "spike":
             pool_template["psp_call"] = pool_template["psp_call"].replace(
@@ -771,6 +786,72 @@ class Pooling(SpecificProjection):
 
         # Clean-up
         self._specific_template["clear_container"] = pooling_template_cuda["clear"]
+
+        # Additional data of the Metal kernel
+        if self._metal_pre_base is not None:
+            self._specific_template["declare_connectivity_matrix"] += MetalPoolingTemplate.metal_pool_declare
+            self._specific_template["host_device_transfer"] += MetalPoolingTemplate.metal_pool_transfer
+            self._specific_template["clear_container"] += MetalPoolingTemplate.metal_pool_clear
+            self._specific_template["wrapper"] = self._specific_template["wrapper"].replace(
+                "        // Other methods", MetalPoolingTemplate.metal_pool_wrapper % base_ids + "\n        // Other methods"
+            )
+
+    def _generate_metal(self, base_ids, sum_default, final_result):
+        """
+        Pooling kernel tuned for Apple GPUs, see MetalPoolingTemplate.py.
+        Returns the psp templates, or None if not applicable.
+        """
+        pre_geometry = [int(g) for g in self.pre.geometry]
+        extent = [int(e) for e in self.extent[: len(pre_geometry)]]
+        coords = np.asarray(self.pre_coordinates, dtype=np.int64).reshape(self.post.size, -1)
+        if coords.shape[1] != len(pre_geometry):
+            return None
+        # all windows must lie within the pre-synaptic population
+        if np.any(coords < 0) or np.any(coords + np.array(extent) > np.array(pre_geometry)):
+            return None
+
+        strides = [int(np.prod(pre_geometry[d + 1:])) for d in range(len(pre_geometry))]
+        self._metal_pre_base = (coords @ np.array(strides, dtype=np.int64)).astype(np.int32).tolist()
+
+        window_size = int(np.prod(extent))
+        if window_size >= 16384:
+            threads = 1024
+        elif window_size >= 1024:
+            threads = 256
+        else:
+            threads = 32 if window_size >= 64 else 1
+        block_size = max(threads, 128)
+
+        offset_code = ""
+        for d in reversed(range(len(extent))):
+            if extent[d] > 1:
+                offset_code += "        offset += (rest %% %(e)s) * %(s)s; rest /= %(e)s;\n" % {"e": extent[d], "s": strides[d]}
+
+        operation = self.synapse_type.operation
+        combine = MetalPoolingTemplate.metal_pool_operation[operation]
+        ids = dict(base_ids)
+        ids.update(
+            {
+                "threads": threads,
+                "block_size": block_size,
+                "num_blocks": (self.post.size * threads + block_size - 1) // block_size,
+                "window_size": window_size,
+                "offset_code": offset_code,
+                "sum_default": sum_default,
+                "operation": combine % {"v": "local_r"},
+                "final_result": final_result.replace("psp[bIdx]", "psp[out]"),
+            }
+        )
+        reduction = ""
+        if threads >= 32:
+            reduction += MetalPoolingTemplate.metal_pool_simd_reduction % dict(ids, combine=combine % {"v": "other"})
+        if threads > 32:
+            reduction += MetalPoolingTemplate.metal_pool_threadgroup_reduction % dict(
+                ids, combine=combine % {"v": "other"}, num_simd=threads // 32
+            )
+        ids["reduction_code"] = reduction
+
+        return {key: value % ids for key, value in MetalPoolingTemplate.metal_pool.items()}
 
     @staticmethod
     def _coordinates_to_rank(name, geometry):

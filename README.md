@@ -63,8 +63,19 @@ synaptic plasticity), `Convolution` and `Pooling`, monitors, random
 variables and global operations. Not supported (yet): profiling and
 non-uniform delays; spiking networks are experimental.
 
-Setting the environment variable `ANNARCHY_METAL_PROFILE=1` prints the GPU
-time of each kernel at the end of the process.
+Some kernels are tuned for Apple GPUs instead of being translated:
+convolutions with a psp of the form `f(pre) * w` and padding 0 (zero-padded
+input, several filters and positions per thread, vector loads), pooling,
+`csr` transmission, and global operations (`max(r)` etc. stay on the GPU).
+Independent kernels of a time step run concurrently on the GPU.
+
+Environment variables:
+
+* `ANNARCHY_METAL_PROFILE=1` prints the GPU time of each kernel at the end of
+  the process (the kernels are executed one by one, so the total is higher).
+* `ANNARCHY_METAL_SERIAL=1` executes the kernels one after another.
+* `tools/metal_bench/conv_micro.py` compares and benchmarks convolution and
+  pooling kernels between paradigms.
 
 ## Dependencies
 

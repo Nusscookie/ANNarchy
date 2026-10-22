@@ -49,6 +49,10 @@
 #define __restrict__ __restrict
 #endif
 
+// Markers of kernel arguments for the Metal translator (generator/Metal/Translator.py)
+#define __annmtl_constant__
+#define __annmtl_deref__
+
 typedef int cudaError_t;
 enum : int {
     cudaSuccess = 0,

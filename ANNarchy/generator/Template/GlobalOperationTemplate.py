@@ -274,7 +274,7 @@ __global__ void cuMaxValue(%(type)s* result, %(type)s *gpu_array, int N)
     unsigned int i = tid;
 
     extern %(type)s __shared__ sdata[];
-    %(type)s localMax = FLT_MIN;
+    %(type)s localMax = -FLT_MAX;
 
     while(i < N)
     {

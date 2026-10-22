@@ -69,6 +69,15 @@ void annmtl_dispatch(int pipeline,
                      const void* const* buffers, int num_buffers,
                      const void* args, size_t args_size,
                      size_t threadgroup_memory);
+// Same, written[i] != 0 if the kernel may write into buffers[i] (all buffers
+// are assumed to be written by annmtl_dispatch). Kernels that do not access
+// the same buffers run concurrently on the GPU.
+void annmtl_dispatch_rw(int pipeline,
+                        unsigned groups_x, unsigned groups_y, unsigned groups_z,
+                        unsigned threads_x, unsigned threads_y, unsigned threads_z,
+                        const void* const* buffers, const unsigned char* written, int num_buffers,
+                        const void* args, size_t args_size,
+                        size_t threadgroup_memory);
 
 // Synchronization
 void annmtl_flush(void);

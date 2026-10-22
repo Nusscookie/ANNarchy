@@ -1105,6 +1105,48 @@ conn_templates = {
     "post_event": spike_postevent,
 }
 
+# Apple GPUs (Metal paradigm): the rows are processed by groups of 1 - 32 threads
+# of a SIMD-group, depending on the average row length, which accumulate in
+# registers and combine their results with SIMD shuffles (instead of the
+# reduction in shared memory). The host code (invoke_kernel, host_call) is unchanged.
+rate_psp_sum_metal = """
+template<int BLOCKSIZE>
+__global__ void cu_proj%(id_proj)s_psp(%(conn_args)s%(add_args)s, %(float_prec)s* %(target_arg)s ) {
+    if (post_size == 0)
+        return;
+
+    // threads per row: average row length rounded up to a power of 2 (at most 32)
+    const %(size_type)s first = row_ptr[rank_post[0]];
+    const %(size_type)s last = row_ptr[rank_post[post_size - 1] + 1];
+    const %(size_type)s avg = (last - first + post_size - 1) / post_size;
+    int lanes = 1;
+    while (lanes < 32 && lanes < avg)
+        lanes *= 2;
+
+    const unsigned int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned int lane = gid %% lanes;
+    const unsigned int rows_per_iteration = (gridDim.x * blockDim.x) / lanes;
+
+    // all threads of a SIMD-group take the same number of iterations (shuffles)
+    for (unsigned int base = (gid / 32) * (32 / lanes); base < post_size; base += rows_per_iteration) {
+        const unsigned int row = base + (gid %% 32) / lanes;
+        %(idx_type)s rk_post = 0;
+        %(float_prec)s sum = 0.0;
+        if (row < post_size) {
+            rk_post = rank_post[row];
+            for (%(size_type)s j = row_ptr[rk_post] + lane; j < row_ptr[rk_post+1]; j += lanes) {
+                sum += %(psp)s
+            }
+        }
+        for (int lane_mask = lanes / 2; lane_mask > 0; lane_mask /= 2)
+            sum += __shfl_xor_sync(0xffffffff, sum, lane_mask);
+
+        if (row < post_size && lane == 0)
+            %(target_arg)s[rk_post] += sum;
+    }
+}
+"""
+
 conn_ids = {
     "local_index": "[j]",
     "semiglobal_index": "[i]",

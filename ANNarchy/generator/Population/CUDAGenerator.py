@@ -18,7 +18,7 @@ from ANNarchy.generator.Utils import (
     tabify,
     check_and_apply_pow_fix,
 )
-from ANNarchy.intern.ConfigManagement import ConfigManager
+from ANNarchy.intern.ConfigManagement import ConfigManager, _check_paradigm
 from ANNarchy.intern import Messages
 from .PopulationGenerator import PopulationGenerator
 from .CUDATemplates import cuda_templates
@@ -958,6 +958,24 @@ class CUDAGenerator(PopulationGenerator):
             "float_prec": ConfigManager().get("precision", self._net_id)
         }
 
+    def _global_op_args(self, ids):
+        """
+        Kernel arguments (header, invoke, call) for the result of a global
+        operation. On Apple GPUs (Metal paradigm), the result stays in device
+        memory, so the host does not need to wait for the GPU in each step.
+        """
+        if _check_paradigm("metal", self._net_id):
+            return (
+                """, __annmtl_deref__ const %(type)s* __restrict__ _%(op)s_%(var)s """ % ids,
+                """, _%(op)s_%(var)s """ % ids,
+                """, pop%(id)s->_gpu_%(op)s_%(var)s""" % ids,
+            )
+        return (
+            """, %(type)s _%(op)s_%(var)s """ % ids,
+            """, _%(op)s_%(var)s """ % ids,
+            """, pop%(id)s->_%(op)s_%(var)s""" % ids,
+        )
+
     def _update_globalops(self, pop):
         """
         Update of global functions is a call of pre-implemented
@@ -970,7 +988,13 @@ class CUDAGenerator(PopulationGenerator):
 
         code = ""
         for op in pop.global_operations:
-            code += global_op_template[op["function"]]["call"] % {
+            call = global_op_template[op["function"]]["call"]
+            if _check_paradigm("metal", self._net_id):
+                # the result stays on the device (see _global_op_args), and
+                # one threadgroup of 256 threads computes the reduction
+                call = re.sub(r"\n\s*cudaMemcpy\(&pop%\(id\)s->[^;]*cudaMemcpyDeviceToHost\);", "", call)
+                call = call.replace("RunConfig(1, 32, 64 * sizeof(", "RunConfig(1, 256, 256 * sizeof(")
+            code += call % {
                 "id": pop.id,
                 "type": ConfigManager().get("precision", self._net_id),
                 "op": op["function"],
@@ -1119,8 +1143,9 @@ class CUDAGenerator(PopulationGenerator):
                     "op": op["function"],
                     "var": op["variable"],
                 }
-                add_args_header += """, %(type)s _%(op)s_%(var)s """ % ids
-                add_args_call += """, pop%(id)s->_%(op)s_%(var)s""" % ids
+                header, _, call = self._global_op_args(ids)
+                add_args_header += header
+                add_args_call += call
 
             # finalize code templates
             device_kernel += CUDATemplates.population_update_kernel["global"][
@@ -1173,9 +1198,10 @@ class CUDAGenerator(PopulationGenerator):
                     "op": op["function"],
                     "var": op["variable"],
                 }
-                add_args_header += """, %(type)s _%(op)s_%(var)s """ % ids
-                add_args_invoke += """, _%(op)s_%(var)s """ % ids
-                add_args_call += """, pop%(id)s->_%(op)s_%(var)s""" % ids
+                header, invoke, call = self._global_op_args(ids)
+                add_args_header += header
+                add_args_invoke += invoke
+                add_args_call += call
 
             # finalize code templates
             device_kernel += CUDATemplates.population_update_kernel["local"][
@@ -1352,9 +1378,10 @@ class CUDAGenerator(PopulationGenerator):
                     "op": op["function"],
                     "var": op["variable"],
                 }
-                add_args_header += """, %(type)s _%(op)s_%(var)s """ % ids
-                add_args_invoke += """, _%(op)s_%(var)s """ % ids
-                add_args_call += """, pop%(id)s->_%(op)s_%(var)s""" % ids
+                header, invoke, call = self._global_op_args(ids)
+                add_args_header += header
+                add_args_invoke += invoke
+                add_args_call += call
 
             # finalize code templates
             body += CUDATemplates.population_update_kernel["global"]["body"] % {
@@ -1388,9 +1415,10 @@ class CUDAGenerator(PopulationGenerator):
                     "op": op["function"],
                     "var": op["variable"],
                 }
-                add_args_header += """, %(type)s _%(op)s_%(var)s """ % ids
-                add_args_invoke += """, _%(op)s_%(var)s """ % ids
-                add_args_call += """, pop%(id)s->_%(op)s_%(var)s""" % ids
+                header, invoke, call = self._global_op_args(ids)
+                add_args_header += header
+                add_args_invoke += invoke
+                add_args_call += call
 
             # Is there a refractory period?
             if pop.neuron_type.refractory or pop.refractory:

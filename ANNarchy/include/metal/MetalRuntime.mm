@@ -30,6 +30,7 @@
 #include <map>
 #include <mutex>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #if !__has_feature(objc_arc)
@@ -73,6 +74,13 @@ struct State {
 
     // built-in kernels for memory transfers
     int copy_u32 = -1, copy_u8 = -1, fill_u32 = -1, fill_u8 = -1;
+
+    // The kernels of a compute encoder run concurrently, a memory barrier is
+    // inserted before a kernel accessing a buffer written by a previous kernel
+    // (or writing a buffer accessed by a previous kernel) since the last
+    // barrier. ANNARCHY_METAL_SERIAL=1 executes the kernels one after another.
+    bool concurrent = std::getenv("ANNARCHY_METAL_SERIAL") == nullptr;
+    std::unordered_set<const void*> epoch_reads, epoch_writes;
 
     // Optional profiling (environment variable ANNARCHY_METAL_PROFILE=1): each
     // kernel is executed in its own command buffer and its GPU time is measured.
@@ -228,9 +236,38 @@ id<MTLComputeCommandEncoder> current_encoder() {
     State& s = state();
     if (s.command_buffer == nil)
         s.command_buffer = [s.queue commandBuffer];
-    if (s.encoder == nil)
-        s.encoder = [s.command_buffer computeCommandEncoder];
+    if (s.encoder == nil) {
+        s.encoder = s.concurrent ? [s.command_buffer computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent]
+                                 : [s.command_buffer computeCommandEncoder];
+        s.epoch_reads.clear();
+        s.epoch_writes.clear();
+    }
     return s.encoder;
+}
+
+// Inserts a memory barrier if the next kernel conflicts with the kernels
+// encoded since the last barrier. uses: (buffer, written)
+void track_hazards(id<MTLComputeCommandEncoder> enc, const std::pair<id<MTLBuffer>, bool>* uses, int num_uses) {
+    State& s = state();
+    if (!s.concurrent)
+        return;
+    bool conflict = false;
+    for (int i = 0; i < num_uses && !conflict; i++) {
+        const void* key = (__bridge const void*)uses[i].first;
+        conflict = s.epoch_writes.count(key) > 0 || (uses[i].second && s.epoch_reads.count(key) > 0);
+    }
+    if (conflict) {
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        s.epoch_reads.clear();
+        s.epoch_writes.clear();
+    }
+    for (int i = 0; i < num_uses; i++) {
+        const void* key = (__bridge const void*)uses[i].first;
+        if (uses[i].second)
+            s.epoch_writes.insert(key);
+        else
+            s.epoch_reads.insert(key);
+    }
 }
 
 void commit_current() {
@@ -305,6 +342,8 @@ void encode_copy(id<MTLBuffer> dst, size_t dst_off, id<MTLBuffer> src, size_t sr
     unsigned int groups = (count + tpb - 1) / tpb;
 
     id<MTLComputeCommandEncoder> enc = current_encoder();
+    std::pair<id<MTLBuffer>, bool> uses[2] = {{dst, true}, {src, false}};
+    track_hazards(enc, uses, 2);
     [enc setComputePipelineState:s.pipelines[pso_id]];
     [enc setBuffer:dst offset:dst_off atIndex:0];
     [enc setBuffer:src offset:src_off atIndex:1];
@@ -331,6 +370,8 @@ void encode_fill(id<MTLBuffer> dst, size_t dst_off, unsigned char value, size_t 
     unsigned int groups = (args[0] + tpb - 1) / tpb;
 
     id<MTLComputeCommandEncoder> enc = current_encoder();
+    std::pair<id<MTLBuffer>, bool> uses[1] = {{dst, true}};
+    track_hazards(enc, uses, 1);
     [enc setComputePipelineState:s.pipelines[pso_id]];
     [enc setBuffer:dst offset:dst_off atIndex:0];
     [enc setBytes:args length:sizeof(args) atIndex:1];
@@ -493,6 +534,16 @@ void annmtl_dispatch(int pipeline,
                      const void* const* buffers, int num_buffers,
                      const void* args, size_t args_size,
                      size_t threadgroup_memory) {
+    annmtl_dispatch_rw(pipeline, groups_x, groups_y, groups_z, threads_x, threads_y, threads_z, buffers, nullptr,
+                       num_buffers, args, args_size, threadgroup_memory);
+}
+
+void annmtl_dispatch_rw(int pipeline,
+                        unsigned groups_x, unsigned groups_y, unsigned groups_z,
+                        unsigned threads_x, unsigned threads_y, unsigned threads_z,
+                        const void* const* buffers, const unsigned char* written, int num_buffers,
+                        const void* args, size_t args_size,
+                        size_t threadgroup_memory) {
     @autoreleasepool {
         State& s = state();
         if (pipeline < 0 || pipeline >= static_cast<int>(s.pipelines.size()))
@@ -511,22 +562,29 @@ void annmtl_dispatch(int pipeline,
         }
 
         id<MTLComputeCommandEncoder> enc = current_encoder();
-        [enc setComputePipelineState:pso];
 
+        // resolve the buffers first, a memory barrier must precede the dispatch
+        std::vector<std::pair<id<MTLBuffer>, bool>> uses;
+        std::vector<size_t> offsets(num_buffers, 0);
+        uses.reserve(num_buffers);
         for (int i = 0; i < num_buffers; i++) {
-            if (buffers[i] == nullptr) {
-                [enc setBuffer:nil offset:0 atIndex:i];
-                continue;
-            }
             id<MTLBuffer> buffer = nil;
-            size_t offset = 0;
-            if (!resolve(buffers[i], &buffer, &offset)) {
+            if (buffers[i] != nullptr && !resolve(buffers[i], &buffer, &offsets[i])) {
                 set_error("kernel '" + s.pipeline_names[pipeline] + "': argument " + std::to_string(i) +
                           " is not device memory.");
                 return;
             }
-            [enc setBuffer:buffer offset:offset atIndex:i];
+            uses.emplace_back(buffer, written == nullptr || written[i] != 0);
         }
+        std::vector<std::pair<id<MTLBuffer>, bool>> tracked;
+        for (auto& u : uses)
+            if (u.first != nil)
+                tracked.push_back(u);
+        track_hazards(enc, tracked.data(), static_cast<int>(tracked.size()));
+
+        [enc setComputePipelineState:pso];
+        for (int i = 0; i < num_buffers; i++)
+            [enc setBuffer:uses[i].first offset:offsets[i] atIndex:i];
 
         if (args_size > 0) {
             if (args_size <= kMaxInlineBytes) {

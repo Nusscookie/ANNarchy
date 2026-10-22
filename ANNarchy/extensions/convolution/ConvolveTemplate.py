@@ -226,7 +226,7 @@ cuda_convolution_single_filter = {
 
 %(convolve_code)s
 
-    psp[bIdx] += sum;
+    psp[bIdx] += %(sum_code)s;
 }
 """,
     "invoke": """
@@ -264,7 +264,7 @@ cuda_convolution_bank_of_filter = {
 
 %(convolve_code)s
 
-    psp[bIdx] += sum;
+    psp[bIdx] += %(sum_code)s;
 }
 """,
     "invoke": """void convolution_proj%(id_proj)s(RunConfig cfg, %(float_prec)s* psp, const int* pre_coords, const %(float_prec)s* w%(pre_variables_header)s) {

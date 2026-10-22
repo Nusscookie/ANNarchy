@@ -165,6 +165,17 @@ class KernelParam:
     """
 
     def __init__(self, decl, position=0):
+        # pointers marked with __annmtl_constant__ are read through the constant
+        # address space (uniform access, e.g. weights shared by all threads)
+        self.address_space = "device"
+        if "__annmtl_constant__" in decl:
+            self.address_space = "constant"
+            decl = decl.replace("__annmtl_constant__", " ")
+        # pointers marked with __annmtl_deref__ hold a scalar in device memory
+        # (e.g. the result of a global operation), which the kernel body uses
+        # under the name of the argument
+        self.deref = "__annmtl_deref__" in decl
+        decl = decl.replace("__annmtl_deref__", " ")
         d = normalize_type(decl)
 
         # unnamed parameters are valid C++, e.g. "const long int, const float dt"
@@ -197,9 +208,15 @@ class KernelParam:
         if not re.match(r"^\w+$", self.name):
             raise MetalTranslationError(f"could not parse kernel argument '{decl}'")
 
+    def msl_buffer_name(self):
+        return "annmtl_deref_" + self.name if self.deref else self.name
+
     def msl_buffer_decl(self, index):
+        name = self.msl_buffer_name()
+        if self.address_space == "constant":
+            return f"constant {msl_type(self.base_type)}* {name} [[buffer({index})]]"
         const = "const " if self.is_const else ""
-        return f"{const}device {msl_type(self.base_type)}* {self.name} [[buffer({index})]]"
+        return f"{const}device {msl_type(self.base_type)}* {name} [[buffer({index})]]"
 
     def msl_field_decl(self):
         return f"{msl_type(self.base_type)} {self.name};"
@@ -277,6 +294,9 @@ _local_pointer = re.compile(
     r"(^|[;{}(])(\s*)(?:(?:const|volatile|unsigned|signed|long|short)\s+)*\w+\s*\*\s*(\w+)\s*=(?!=)",
     re.MULTILINE,
 )
+
+# __shfl_xor_sync(mask, value, lane_mask) with simple arguments
+_shfl_xor = re.compile(r"__shfl_xor_sync\(\s*([^,()]+),\s*([^,()]+(?:\[[^\]]*\])?),\s*([^,()]+)\)")
 
 # One step of a warp-synchronous reduction: a statement accessing [idx + offset]
 def _reduction_step(offset, first=False):
@@ -380,6 +400,9 @@ def translate_kernel_body(kernel):
     # warp-synchronous reductions
     body = _warp_reduction.sub(_replace_warp_reduction, body)
 
+    # warp shuffles (the mask is ignored, all threads of the SIMD-group take part)
+    body = _shfl_xor.sub(r"simd_shuffle_xor(\2, (ushort)(\3))", body)
+
     # local pointers: the address space is deduced
     body = _local_pointer.sub(lambda m: f"{m.group(1)}{m.group(2)}auto {m.group(3)} =", body)
 
@@ -431,6 +454,9 @@ def translate_kernel(kernel, constants):
     for p in kernel.scalars:
         const = "const " if p.is_const else ""
         prologue += f"    {const}{msl_type(p.base_type)} {p.name} = annmtl_args.{p.name};\n"
+    for p in kernel.buffers:
+        if p.deref:
+            prologue += f"    const {msl_type(p.base_type)} {p.name} = {p.msl_buffer_name()}[0];\n"
     for decl in hoisted:
         prologue += "    " + decl + "\n"
 
@@ -529,18 +555,22 @@ def generate_launcher(kernel, template_value, constants):
     else:
         args_ptr, args_size = "nullptr", "0"
 
+    # buffers and if they may be written by the kernel (non-const pointers)
     buffers = [f"(const void*){p.name}" for p in kernel.buffers]
+    written = ["0" if p.is_const or p.address_space == "constant" else "1" for p in kernel.buffers]
     if len(constants) > 0:
         buffers.append("(const void*)annmtl_get_constants()")
+        written.append("0")
     if len(buffers) > 0:
         code += f"    const void* annmtl_buffers[] = {{ {', '.join(buffers)} }};\n"
-        buffers_ptr = "annmtl_buffers"
+        code += f"    static const unsigned char annmtl_written[] = {{ {', '.join(written)} }};\n"
+        buffers_ptr, written_ptr = "annmtl_buffers", "annmtl_written"
     else:
-        buffers_ptr = "nullptr"
+        buffers_ptr, written_ptr = "nullptr", "nullptr"
 
     code += (
-        f"    annmtl_dispatch(annmtl_pso, annmtl_nb.x, annmtl_nb.y, annmtl_nb.z, annmtl_tpb.x, annmtl_tpb.y, annmtl_tpb.z, "
-        f"{buffers_ptr}, {len(buffers)}, {args_ptr}, {args_size}, annmtl_smem);\n"
+        f"    annmtl_dispatch_rw(annmtl_pso, annmtl_nb.x, annmtl_nb.y, annmtl_nb.z, annmtl_tpb.x, annmtl_tpb.y, annmtl_tpb.z, "
+        f"{buffers_ptr}, {written_ptr}, {len(buffers)}, {args_ptr}, {args_size}, annmtl_smem);\n"
     )
     code += "}\n"
     return code

@@ -193,6 +193,10 @@ inline void half_warp_reduce_sum(volatile threadgroup T* data, unsigned int tid)
     if (tid == 0) data[0] = v;
 }
 
+// Loads 4 consecutive floats without alignment requirement
+inline float4 annmtl_load4(const device float* p) { return float4(*(const device packed_float4*)p); }
+inline float4 annmtl_load4(constant float* p) { return float4(*(constant packed_float4*)p); }
+
 /****************************************
  * Random number generation             *
  ****************************************/

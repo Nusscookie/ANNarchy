@@ -16,7 +16,7 @@ from ANNarchy.core.Population import Population
 from ANNarchy.core.PopulationView import PopulationView
 
 from ANNarchy.intern.SpecificProjection import SpecificProjection
-from ANNarchy.intern.ConfigManagement import ConfigManager, _check_precision
+from ANNarchy.intern.ConfigManagement import ConfigManager, _check_precision, _check_paradigm
 from ANNarchy.intern import Messages
 
 from ANNarchy.generator.Utils import (
@@ -295,6 +295,11 @@ class CUDAGenerator(ProjectionGenerator):
             if proj._storage_order == "post_to_pre":
                 self._templates.update(CSR_CUDA.conn_templates)
                 self._template_ids.update(CSR_CUDA.conn_ids)
+                if _check_paradigm("metal", self._net_id):
+                    # kernel tuned for Apple GPUs
+                    rate_psp = deepcopy(self._templates["rate_psp"])
+                    rate_psp["device_kernel"]["sum"] = CSR_CUDA.rate_psp_sum_metal
+                    self._templates["rate_psp"] = rate_psp
             else:
                 self._templates.update(CSR_T_CUDA.conn_templates)
                 self._template_ids.update(CSR_T_CUDA.conn_ids)
@@ -1325,9 +1330,14 @@ if(%(condition)s){
                 "type": attr["ctype"],
                 "func": glop["function"],
             }
-            kernel_args_decl += ", %(type)s pre__%(func)s_%(name)s" % ids
+            if _check_paradigm("metal", proj.net_id):
+                # the result stays in device memory (see PopulationGenerator._global_op_args)
+                kernel_args_decl += ", __annmtl_deref__ const %(type)s* __restrict__ pre__%(func)s_%(name)s" % ids
+                kernel_args_call += ", pop%(id)s->_gpu_%(func)s_%(name)s" % ids
+            else:
+                kernel_args_decl += ", %(type)s pre__%(func)s_%(name)s" % ids
+                kernel_args_call += ", pop%(id)s->_%(func)s_%(name)s" % ids
             kernel_args_invoke += ", pre__%(func)s_%(name)s" % ids
-            kernel_args_call += ", pop%(id)s->_%(func)s_%(name)s" % ids
 
         for glop in proj.synapse_type.description["post_global_operations"]:
             attr = PopulationGenerator._get_attr(proj.post, glop["variable"])
@@ -1337,9 +1347,14 @@ if(%(condition)s){
                 "type": attr["ctype"],
                 "func": glop["function"],
             }
-            kernel_args_decl += ", %(type)s post__%(func)s_%(name)s" % ids
+            if _check_paradigm("metal", proj.net_id):
+                # the result stays in device memory (see PopulationGenerator._global_op_args)
+                kernel_args_decl += ", __annmtl_deref__ const %(type)s* __restrict__ post__%(func)s_%(name)s" % ids
+                kernel_args_call += ", pop%(id)s->_gpu_%(func)s_%(name)s" % ids
+            else:
+                kernel_args_decl += ", %(type)s post__%(func)s_%(name)s" % ids
+                kernel_args_call += ", pop%(id)s->_%(func)s_%(name)s" % ids
             kernel_args_invoke += ", post__%(func)s_%(name)s" % ids
-            kernel_args_call += ", pop%(id)s->_%(func)s_%(name)s" % ids
 
         #
         # event-driven spike synapses require the access to last_spike member

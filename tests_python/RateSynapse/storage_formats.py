@@ -45,6 +45,7 @@ single_thread = {
     # SpecificProjections
     "test_Convolution": ["lil", "auto"],
     "test_Pooling": ["lil", "auto"],
+    "test_ConvolutionKernels": ["lil"],
     "test_CurrentInjection": ["lil", "auto"],
 }
 
@@ -84,6 +85,7 @@ open_mp = {
     # SpecificProjections
     "test_Convolution": ["lil", "auto"],
     "test_Pooling": ["lil", "auto"],
+    "test_ConvolutionKernels": ["lil"],
     "test_CurrentInjection": ["lil", "auto"],
 }
 
@@ -121,5 +123,6 @@ cuda = {
     # SpecificProjections
     "test_Convolution": ["csr"],
     "test_Pooling": ["csr"],
+    "test_ConvolutionKernels": ["csr"],
     "test_CurrentInjection": ["csr"],
 }
