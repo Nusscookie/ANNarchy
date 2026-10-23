@@ -197,6 +197,31 @@ inline void half_warp_reduce_sum(volatile threadgroup T* data, unsigned int tid)
 inline float4 annmtl_load4(const device float* p) { return float4(*(const device packed_float4*)p); }
 inline float4 annmtl_load4(constant float* p) { return float4(*(constant packed_float4*)p); }
 
+// FFT in threadgroup memory (FFT-based convolution)
+inline float2 annmtl_cmul(float2 a, float2 b) { return float2(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x); }
+inline uint annmtl_bitrev(uint i, uint log_n) { return log_n == 0 ? 0 : reverse_bits(i) >> (32 - log_n); }
+
+// In-place radix-2 FFT of the n = 2^log_n values of x, which are stored in
+// bit-reversed order, executed by n/2 threads of the threadgroup (tid < n/2).
+// twiddle[t] = exp(-2 pi i t / 2^log_n_max) for t < 2^(log_n_max-1); the
+// inverse transform uses the conjugates and is not scaled.
+inline void annmtl_fft(threadgroup float2* x, uint tid, uint log_n, uint log_n_max, const device float2* twiddle, bool inverse) {
+    for (uint log_m = 0; log_m < log_n; log_m++) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint m = 1u << log_m;
+        uint k = tid & (m - 1);
+        uint i = ((tid >> log_m) << (log_m + 1)) + k;
+        float2 w = twiddle[k << (log_n_max - 1 - log_m)];
+        if (inverse)
+            w.y = -w.y;
+        float2 a = x[i];
+        float2 b = annmtl_cmul(x[i + m], w);
+        x[i] = a + b;
+        x[i + m] = a - b;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
 /****************************************
  * Random number generation             *
  ****************************************/
@@ -318,6 +343,30 @@ kernel void clear_sum(device %(float_prec)s* sum [[buffer(0)]], constant int& nu
         j += blockDim.x * gridDim.x;
     }
 }
+
+// Clears up to 8 arrays in one dispatch, the y-coordinate of the grid selects the array
+struct annmtl_clear_sums_args { int num_elem[8]; };
+kernel void clear_sums(device %(float_prec)s* s0 [[buffer(0)]], device %(float_prec)s* s1 [[buffer(1)]],
+                       device %(float_prec)s* s2 [[buffer(2)]], device %(float_prec)s* s3 [[buffer(3)]],
+                       device %(float_prec)s* s4 [[buffer(4)]], device %(float_prec)s* s5 [[buffer(5)]],
+                       device %(float_prec)s* s6 [[buffer(6)]], device %(float_prec)s* s7 [[buffer(7)]],
+                       constant annmtl_clear_sums_args& args [[buffer(8)]],
+                       uint2 gid [[thread_position_in_grid]],
+                       uint2 grid [[threads_per_grid]]) {
+    device %(float_prec)s* sum;
+    switch (gid.y) {
+        case 0: sum = s0; break;
+        case 1: sum = s1; break;
+        case 2: sum = s2; break;
+        case 3: sum = s3; break;
+        case 4: sum = s4; break;
+        case 5: sum = s5; break;
+        case 6: sum = s6; break;
+        default: sum = s7; break;
+    }
+    for (int j = gid.x; j < args.num_elem[gid.y]; j += grid.x)
+        sum[j] = 0.0;
+}
 """
 
 # Host side: replaces the corresponding parts of CUDABaseTemplate.device_kernel
@@ -365,10 +414,39 @@ void init_curand_states( int numBlocks, int numThreads, curandState* states, uns
 #endif
 }
 
+// The sums are cleared in batches of 8 arrays (one dispatch each), the last
+// batch is dispatched by call_clear_sum_flush() at the end of the clear section.
+static const void* clear_sums_buffers[8];
+static struct { int num_elem[8]; } clear_sums_args;
+static int clear_sums_count = 0;
+static int clear_sums_max_elem = 0;
+
+void call_clear_sum_flush() {
+    if (clear_sums_count == 0)
+        return;
+    static int pso = annmtl_pipeline("clear_sums");
+    for (int i = clear_sums_count; i < 8; i++) {
+        // unused slots: bound to the first array, which is not accessed
+        clear_sums_buffers[i] = clear_sums_buffers[0];
+        clear_sums_args.num_elem[i] = 0;
+    }
+    unsigned threads = 256;
+    unsigned groups = (clear_sums_max_elem + threads - 1) / threads;
+    if (groups > 64)
+        groups = 64;
+    annmtl_dispatch(pso, groups, clear_sums_count, 1, threads, 1, 1, clear_sums_buffers, 8, &clear_sums_args, sizeof(clear_sums_args), 0);
+    clear_sums_count = 0;
+    clear_sums_max_elem = 0;
+}
+
 void call_clear_sum(RunConfig cfg, int num_elem, %(float_prec)s *sum) {
-    static int pso = annmtl_pipeline("clear_sum");
-    const void* buffers[] = { sum };
-    annmtl_dispatch(pso, cfg.nb.x, cfg.nb.y, cfg.nb.z, cfg.tpb.x, cfg.tpb.y, cfg.tpb.z, buffers, 1, &num_elem, sizeof(num_elem), 0);
+    clear_sums_buffers[clear_sums_count] = sum;
+    clear_sums_args.num_elem[clear_sums_count] = num_elem;
+    clear_sums_count++;
+    if (num_elem > clear_sums_max_elem)
+        clear_sums_max_elem = num_elem;
+    if (clear_sums_count == 8)
+        call_clear_sum_flush();
 }
 
 void call_clear_num_events(RunConfig cfg, unsigned int* num_events) {

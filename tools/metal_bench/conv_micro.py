@@ -40,6 +40,11 @@ def cases():
         "pool_global_mean": ((188, 188), (1, 1), "pool", None, dict(operation="mean", extent=(188, 188))),
         "pool_global_max": ((75, 75, 2), (1, 1, 2), "pool", None, dict(operation="max", extent=(75, 75, 1))),
         "pool_2x2_max": ((100, 100), (50, 50), "pool", None, dict(operation="max", extent=(2, 2))),
+        # large kernels on large maps (candidates for an FFT-based convolution)
+        "floor_3x3": ((64, 64), (64, 64), "filter", rnd(3, 3), dict()),
+        "big2d_31x31": ((256, 256), (256, 256), "filter", rnd(31, 31), dict()),
+        "big2d_63x63": ((512, 512), (512, 512), "filter", rnd(63, 63), dict()),
+        "bank2d_31x31_f8": ((128, 128), (128, 128, 8), "filters", rnd(8, 31, 31), dict()),
     }
 
 

@@ -46,6 +46,7 @@ single_thread = {
     "test_Convolution": ["lil", "auto"],
     "test_Pooling": ["lil", "auto"],
     "test_ConvolutionKernels": ["lil"],
+    "test_ConvolutionFFT": ["lil"],
     "test_CurrentInjection": ["lil", "auto"],
 }
 
@@ -86,6 +87,7 @@ open_mp = {
     "test_Convolution": ["lil", "auto"],
     "test_Pooling": ["lil", "auto"],
     "test_ConvolutionKernels": ["lil"],
+    "test_ConvolutionFFT": ["lil"],
     "test_CurrentInjection": ["lil", "auto"],
 }
 
@@ -124,5 +126,6 @@ cuda = {
     "test_Convolution": ["csr"],
     "test_Pooling": ["csr"],
     "test_ConvolutionKernels": ["csr"],
+    "test_ConvolutionFFT": ["csr"],
     "test_CurrentInjection": ["csr"],
 }

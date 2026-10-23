@@ -67,6 +67,12 @@ Some kernels are tuned for Apple GPUs instead of being translated:
 convolutions with a psp of the form `f(pre) * w` and padding 0 (zero-padded
 input, several filters and positions per thread, vector loads), pooling,
 `csr` transmission, and global operations (`max(r)` etc. stay on the GPU).
+Large convolutions (`sum` or `mean`, filters spanning the first two dimensions
+and either applied to each channel or summing over all channels, single filters
+or banks) are computed with FFTs when this is estimated to be faster, e.g. 3.5x
+for a 63x63 filter on a 512x512 map. The sums of all populations are cleared
+with one dispatch per 8 arrays. The results differ from the
+direct computation by rounding errors (~1e-6 of the largest output).
 Independent kernels of a time step run concurrently on the GPU.
 
 Environment variables:
@@ -74,6 +80,8 @@ Environment variables:
 * `ANNARCHY_METAL_PROFILE=1` prints the GPU time of each kernel at the end of
   the process (the kernels are executed one by one, so the total is higher).
 * `ANNARCHY_METAL_SERIAL=1` executes the kernels one after another.
+* `ANNARCHY_METAL_CONV_FFT=0` disables the FFT-based convolution, `=1` uses it
+  for every applicable projection (default `auto`). Read at compile time.
 * `tools/metal_bench/conv_micro.py` compares and benchmarks convolution and
   pooling kernels between paradigms.
 

@@ -44,6 +44,7 @@ class MetalGenerator(CUDAGenerator):
                 code = rfile.read()
             code = code.replace("#include <cuda_runtime_api.h>\n", MetalTemplates.compat_include)
             code = code.replace("#include <curand_kernel.h>\n", "")
+            code = code.replace("void call_clear_num_events(", "void call_clear_sum_flush();\nvoid call_clear_num_events(")
             code = re.sub(
                 r"inline void setDevice\(const int device_id\) \{.*?\n\}",
                 lambda m: MetalTemplates.set_device,
@@ -109,6 +110,13 @@ class MetalGenerator(CUDAGenerator):
         with open(core_file, "r", encoding="utf-8") as rfile:
             if "<<<" in rfile.read():
                 Messages.error("Metal code generation failed: kernel launch in", core_file)
+
+    def _body_resetcomputesum_pop(self, pop_gen):
+        # call_clear_sum() collects the arrays, the last batch is cleared here
+        code = super()._body_resetcomputesum_pop(pop_gen)
+        if code.strip() != "":
+            code += "\n    call_clear_sum_flush();\n"
+        return code
 
     @staticmethod
     def _split_sections(code):

@@ -21,7 +21,7 @@ from ANNarchy.extensions.convolution.ConvolveTemplate import (
     cuda_convolution_bank_of_filter_4d,
     cuda_convolution_single_filter
 )
-from ANNarchy.extensions.convolution import MetalConvolveTemplate
+from ANNarchy.extensions.convolution import MetalConvolveTemplate, MetalFFTConvolveTemplate
 from ANNarchy.extensions.convolution.Utils import SharedSynapse
 
 # Indices used for each dimension
@@ -164,6 +164,11 @@ class Convolution(SpecificProjection):
                 raise AttributeError("Mismatch between filter dimensions")
 
             self.cyInstance.w = value
+            if _check_paradigm("cuda", self.net_id):
+                # triggers host-to-device transfer at begin of simulate()
+                self.cyInstance.w_dirty = True
+            if getattr(self, "_metal_fft", None) is not None:
+                self._metal_fft_set_filters()
 
     def connect_filter(
         self,
@@ -517,6 +522,14 @@ class Convolution(SpecificProjection):
         if getattr(self, "_metal_plan", None) is not None:
             self.cyInstance.pre_base = self._metal_plan["pre_base"]
             self.cyInstance.pre_base_dirty = True
+
+        # Metal FFT kernels: filter spectra and output tables
+        if getattr(self, "_metal_fft", None) is not None:
+            self._metal_fft_set_filters()
+            self.cyInstance.fft_twiddles = self._metal_fft["twiddles"]
+            self.cyInstance.fft_row_ptr = self._metal_fft["row_ptr"]
+            self.cyInstance.fft_entries = self._metal_fft["entries"]
+            self.cyInstance.fft_tables_dirty = True
 
         # Set delays after instantiation
         if self.delays > 0.0:
@@ -1065,6 +1078,7 @@ class Convolution(SpecificProjection):
 
         # Apple GPUs: kernels tuned for Metal, if applicable
         self._metal_plan = None
+        self._metal_fft = None
         if _check_paradigm("metal", self.net_id):
             self._generate_metal(code_ids)
 
@@ -1202,6 +1216,9 @@ class Convolution(SpecificProjection):
             "num_filters": num_filters,
             "pre_geometry": pre_geometry,
             "padded_size": padded_size,
+            "padded_geometry": padded_geometry,
+            "lower": lower,
+            "coords": coords,
             "offset_pre": [lower[d] + (self._center_filter(filter_shape[d]) if d < dim_filter else 0) for d in range(dim_pre)],
             "strides": strides,
             "psp_pre": psp_pre,
@@ -1215,6 +1232,13 @@ class Convolution(SpecificProjection):
         """
         plan = self._metal_conv_plan()
         if plan is None:
+            return
+
+        # large filters: FFT-based convolution
+        fft = self._metal_fft_plan(plan)
+        if fft is not None:
+            self._metal_fft = fft
+            self._generate_metal_fft(code_ids, plan, fft)
             return
         self._metal_plan = plan
 
@@ -1340,6 +1364,262 @@ class Convolution(SpecificProjection):
         self._specific_template["clear_container"] += MetalConvolveTemplate.metal_conv_clear
         self._specific_template["wrapper"] = self._specific_template["wrapper"].replace(
             "        // Other methods", MetalConvolveTemplate.metal_conv_wrapper % ids + "\n        // Other methods"
+        )
+
+    @staticmethod
+    def _metal_nonnegative(expr):
+        """
+        True if the C++ expression is a product of even powers pow(x, 2k) and
+        non-negative constants, i.e. it can not be negative.
+        """
+        expr = expr.strip()
+        while expr.startswith("(") and expr.endswith(")"):
+            depth = 0
+            for i, c in enumerate(expr):
+                depth += (c == "(") - (c == ")")
+                if depth == 0 and i < len(expr) - 1:
+                    break
+            else:
+                expr = expr[1:-1].strip()
+                continue
+            break
+
+        # split into top-level factors and arguments
+        def split(text, sep):
+            parts, depth, current = [], 0, ""
+            for c in text:
+                depth += (c == "(") - (c == ")")
+                if depth == 0 and c == sep:
+                    parts.append(current)
+                    current = ""
+                else:
+                    current += c
+            return parts + [current]
+
+        factors = split(expr, "*")
+        if len(factors) > 1:
+            return all(Convolution._metal_nonnegative(f) for f in factors)
+        try:
+            return float(expr.rstrip("f")) >= 0.0
+        except ValueError:
+            pass
+        if expr.startswith("pow(") and expr.endswith(")"):
+            args = split(expr[4:-1], ",")
+            if len(args) == 2:
+                try:
+                    exponent = float(args[1].strip().rstrip("f"))
+                except ValueError:
+                    return False
+                return exponent == int(exponent) and int(exponent) % 2 == 0
+        return False
+
+    def _metal_fft_plan(self, plan):
+        """
+        Checks if the FFT-based kernels (MetalFFTConvolveTemplate.py) apply and
+        are expected to be faster than the direct kernels. Returns None otherwise.
+
+        The environment variable ANNARCHY_METAL_CONV_FFT selects the kernels:
+        "auto" (default) uses the estimated costs, "1" uses the FFT whenever
+        possible and "0" never.
+        """
+        mode = os.environ.get("ANNARCHY_METAL_CONV_FFT", "auto")
+        if mode == "0" or self.synapse_type.operation not in ["sum", "mean"]:
+            return None
+
+        # The filters span the first two dimensions. In each other dimension
+        # (channels), the filter has extent 1 (the channels are filtered
+        # independently, batch) or covers all channels (they are summed, reduce).
+        pre_geometry = plan["pre_geometry"]
+        filter_shape = plan["filter_shape"]
+        dim_pre = len(pre_geometry)
+        if dim_pre < 2 or len(filter_shape) < 2:
+            return None
+        coords = plan["coords"]
+        lower = plan["lower"]
+        extents = list(filter_shape[2:]) + [1] * (dim_pre - len(filter_shape))
+        batch_dims, reduce_dims = [], []
+        for d in range(2, dim_pre):
+            if extents[d - 2] == 1:
+                batch_dims.append(d)
+            elif extents[d - 2] == pre_geometry[d] and np.all(coords[:, d] + lower[d] == 0):
+                reduce_dims.append(d)
+            else:
+                return None
+        num_batch = int(np.prod([pre_geometry[d] for d in batch_dims]))
+        num_reduce = int(np.prod([pre_geometry[d] for d in reduce_dims]))
+
+        # grid without wrap-around, the column kernel keeps the spectra of the
+        # summed channels in threadgroup memory
+        n0, n1 = (max(2, 1 << (int(g) - 1).bit_length()) for g in plan["padded_geometry"][:2])
+        if n0 > 1024 or n1 > 1024 or (num_reduce + 1) * n0 * 8 > 28 * 1024:
+            return None
+
+        # two real channels (or filters) share one complex grid
+        num_filters = plan["num_filters"]
+        pack_channels = num_batch >= 2 and num_filters == 1 and num_reduce == 1
+        pack_filters = num_filters >= 2
+        num_batch_planes = (num_batch + 1) // 2 if pack_channels else num_batch
+        num_sets = (num_filters + 1) // 2 if pack_filters else num_filters
+        num_in_planes = num_batch_planes * num_reduce
+        num_out_planes = num_batch_planes * num_sets
+
+        # window start of each output in the grid
+        base0 = coords[:, 0] + lower[0]
+        base1 = coords[:, 1] + lower[1]
+        if batch_dims:
+            batch = np.ravel_multi_index(tuple(coords[:, batch_dims].T), [pre_geometry[d] for d in batch_dims])
+        else:
+            batch = np.zeros(len(coords), dtype=np.int64)
+        row_lo = int(base0.min())
+        num_rows = int(base0.max()) - row_lo + 1
+
+        # Estimated costs [us], measured on an M5 Pro: the direct kernels compute
+        # ~0.65 MMAC/us, the FFT kernels cost ~12 us (4 dispatches) and ~20 us
+        # per million butterflies (a complex multiply-add counts half).
+        direct = self.post.size * int(np.prod(filter_shape)) / 6.5e5
+        butterflies = (
+            num_in_planes * pre_geometry[0] * n1 / 2 * np.log2(n1)
+            + (num_in_planes + num_out_planes) * n1 * n0 / 2 * np.log2(n0)
+            + num_out_planes * num_reduce * n0 * n1 / 2
+            + num_out_planes * num_rows * n1 / 2 * np.log2(n1)
+        )
+        fft_cost = 12.0 + butterflies / 5e4
+        if mode != "1" and fft_cost >= direct:
+            return None
+
+        # post-synaptic rank, output plane and value index of each output
+        ranks, groups, values = [], [], []
+        for f in range(num_filters):
+            if pack_channels:
+                out_plane, part = batch // 2, batch % 2
+            elif pack_filters:
+                out_plane, part = batch * num_sets + f // 2, f % 2
+            else:
+                out_plane, part = batch * num_sets + f, 0
+            ranks.append(np.arange(len(coords)) * num_filters + f)
+            groups.append(out_plane * num_rows + (base0 - row_lo))
+            values.append(2 * base1 + part)
+        ranks, groups, values = (np.concatenate(a) for a in (ranks, groups, values))
+        order = np.argsort(groups, kind="stable")
+        row_ptr = np.zeros(num_out_planes * num_rows + 1, dtype=np.int64)
+        row_ptr[1:] = np.cumsum(np.bincount(groups, minlength=num_out_planes * num_rows))
+        entries = np.stack((ranks[order], values[order]), axis=1)
+
+        # twiddle factors exp(-2 pi i t / n_max)
+        n_max = max(n0, n1)
+        twiddles = np.exp(-2j * np.pi * np.arange(n_max // 2) / n_max)
+
+        return {
+            "n0": n0,
+            "n1": n1,
+            "batch_dims": batch_dims,
+            "reduce_dims": reduce_dims,
+            "num_reduce": num_reduce,
+            "num_batch_planes": num_batch_planes,
+            "num_in_planes": num_in_planes,
+            "num_out_planes": num_out_planes,
+            "num_sets": num_sets,
+            "num_filters": num_filters,
+            "pack_channels": pack_channels,
+            "pack_filters": pack_filters,
+            "row_lo": row_lo,
+            "num_rows": num_rows,
+            "row_ptr": row_ptr.astype(np.int32).tolist(),
+            "entries": entries.astype(np.int32).ravel().tolist(),
+            "twiddles": np.stack((twiddles.real, twiddles.imag), axis=1).astype(np.float32).ravel().tolist(),
+            "nonnegative_pre": self._metal_nonnegative(plan["psp_pre"]),
+        }
+
+    def _metal_fft_spectra(self, weights):
+        """
+        Spectra of the filters for the FFT-based kernels, conjugated (cross-
+        correlation) and scaled by 1/(N0*N1) (unscaled inverse FFT). Returns
+        (flat list of float, clamp), clamp is 1 if the outputs can not be
+        negative, so that the rounding errors of the FFT are removed from 0.
+        """
+        fft = self._metal_fft
+        n0, n1 = fft["n0"], fft["n1"]
+        w = np.asarray(weights, dtype=np.float64)
+        k0, k1 = w.shape[1:3] if self.multiple else w.shape[0:2]
+        # (filter, summed channel, k0, k1), the channels in row-major order
+        filters = w.reshape((fft["num_filters"], k0, k1, fft["num_reduce"])).transpose(0, 3, 1, 2)
+        spectra = np.conj(np.fft.fft2(filters, s=(n0, n1))) / (n0 * n1)
+        if fft["pack_filters"]:
+            if fft["num_filters"] % 2 == 1:
+                spectra = np.concatenate((spectra, np.zeros_like(spectra[:1])))
+            spectra = spectra[0::2] + 1j * spectra[1::2]
+        flat = np.stack((spectra.real, spectra.imag), axis=-1).astype(np.float32).ravel().tolist()
+        clamp = int(fft["nonnegative_pre"] and bool(np.all(w >= 0.0)))
+        return flat, clamp
+
+    def _metal_fft_set_filters(self):
+        "Transfers the filter spectra to the C++ instance."
+        self.cyInstance.fft_filters, self.cyInstance.fft_clamp = self._metal_fft_spectra(self.weights)
+        self.cyInstance.fft_filters_dirty = True
+
+    def _generate_metal_fft(self, code_ids, plan, fft):
+        """
+        Replaces the CUDA kernels by the FFT-based kernels, see
+        MetalFFTConvolveTemplate.py.
+        """
+        n0, n1 = fft["n0"], fft["n1"]
+        pre_geometry = plan["pre_geometry"]
+
+        # pre-synaptic rank -> value index in the input grid: the batch index b
+        # and the summed channel r are raveled from the coordinates c<d> (the
+        # locals are prefixed, as the psp may use global constants)
+        grid_index_code = ""
+        for d in reversed(range(2, len(pre_geometry))):
+            grid_index_code += "    const int annmtl_c%d = annmtl_idx %% %d; annmtl_idx /= %d;\n" % (d, pre_geometry[d], pre_geometry[d])
+        grid_index_code += "    const int annmtl_i1 = annmtl_idx %% %d; const int annmtl_i0 = annmtl_idx / %d;\n" % (pre_geometry[1], pre_geometry[1])
+        for name, dims in [("annmtl_b", fft["batch_dims"]), ("annmtl_r", fft["reduce_dims"])]:
+            expr = "0"
+            for d in dims:
+                expr = "annmtl_c%d" % d if expr == "0" else "(%s) * %d + annmtl_c%d" % (expr, pre_geometry[d], d)
+            grid_index_code += "    const int %s = %s;\n" % (name, expr)
+        if fft["pack_channels"]:
+            grid_index_code += "    const int annmtl_plane = (annmtl_b / 2) * %d + annmtl_r; const int annmtl_part = annmtl_b %% 2;\n" % fft["num_reduce"]
+        else:
+            grid_index_code += "    const int annmtl_plane = annmtl_b * %d + annmtl_r; const int annmtl_part = 0;\n" % fft["num_reduce"]
+        grid_index_code += "    const int annmtl_x_idx = ((annmtl_plane * %d + annmtl_i0 + %d) * %d + annmtl_i1 + %d) * 2 + annmtl_part;\n" % (
+            n0, plan["offset_pre"][0], n1, plan["offset_pre"][1]
+        )
+
+        ids = dict(code_ids)
+        ids.update(
+            {
+                "pre_size": self.pre.size,
+                "grid_index_code": grid_index_code,
+                "psp_pre": plan["psp_pre"],
+                "n0": n0,
+                "n1": n1,
+                "n0_half": n0 // 2,
+                "n1_half": n1 // 2,
+                "log_n0": n0.bit_length() - 1,
+                "log_n1": n1.bit_length() - 1,
+                "log_n_max": max(n0, n1).bit_length() - 1,
+                "row_first": plan["offset_pre"][0],
+                "num_data_rows": pre_geometry[0],
+                "num_reduce": fft["num_reduce"],
+                "num_batch_planes": fft["num_batch_planes"],
+                "num_in_planes": fft["num_in_planes"],
+                "num_out_planes": fft["num_out_planes"],
+                "num_sets": fft["num_sets"],
+                "row_lo": fft["row_lo"],
+                "num_rows": fft["num_rows"],
+                "sum_code": code_ids["sum_code"].replace("sum", "v"),
+                "x_size": 2 * fft["num_in_planes"] * n0 * n1,
+                "out_size": 2 * fft["num_out_planes"] * fft["num_rows"] * n1,
+            }
+        )
+        for key in ["body", "invoke", "header", "call"]:
+            self._specific_template["psp_" + key] = MetalFFTConvolveTemplate.metal_fft[key] % ids
+
+        self._specific_template["declare_connectivity_matrix"] += MetalFFTConvolveTemplate.metal_fft_declare
+        self._specific_template["host_device_transfer"] += MetalFFTConvolveTemplate.metal_fft_transfer % ids
+        self._specific_template["clear_container"] += MetalFFTConvolveTemplate.metal_fft_clear
+        self._specific_template["wrapper"] = self._specific_template["wrapper"].replace(
+            "        // Other methods", MetalFFTConvolveTemplate.metal_fft_wrapper % ids + "\n        // Other methods"
         )
 
     ################################
